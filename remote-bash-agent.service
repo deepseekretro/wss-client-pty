@@ -1,0 +1,27 @@
+[Unit]
+Description=remote-bash agent (wss-client-pty) - 将本机 tty 挂到 workbench 远程终端
+Documentation=https://github.com/deepseekretro/wss-client-pty
+# 等网络就绪再启动；失败自动重启
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# 参数由安装脚本按用户输入生成到 EnvironmentFile，或直接改下面的 ExecStart
+EnvironmentFile=-/etc/remote-bash-agent.env
+ExecStart=/usr/bin/python3 /usr/local/bin/remote-bash-agent.py --name ${REMOTE_BASH_NAME:-%H} --url ${REMOTE_BASH_URL:-wss://edge02.10w123.com/workbench/wss} --heartbeat ${REMOTE_BASH_HEARTBEAT:-15}
+# 失败即重启（含崩溃 / 退出码非 0 / 被信号杀死），重启前等待 5 秒
+Restart=on-failure
+RestartSec=5
+# 防止守护了 5 次以上进入失败状态
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+# 环境清理与安全
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
