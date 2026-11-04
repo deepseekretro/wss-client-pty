@@ -7,18 +7,17 @@ After=network-online.target
 
 [Service]
 Type=simple
-# 参数由安装脚本按用户输入生成到 EnvironmentFile，或直接改下面的 ExecStart
-EnvironmentFile=-/etc/remote-bash-agent.env
-ExecStart=/usr/bin/python3 /usr/local/bin/remote-bash-agent.py --name ${REMOTE_BASH_NAME:-%H} --url ${REMOTE_BASH_URL:-wss://edge02.10w123.com/workbench/wss} --heartbeat ${REMOTE_BASH_HEARTBEAT:-15}
-# 失败即重启（含崩溃 / 退出码非 0 / 被信号杀死），重启前等待 5 秒
+# 参数由安装脚本生成到 EnvironmentFile（全量写入，无默认值依赖）
+EnvironmentFile=/etc/remote-bash-agent.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /usr/local/bin/remote-bash-agent.py --name $REMOTE_BASH_NAME --url $REMOTE_BASH_URL --heartbeat $REMOTE_BASH_HEARTBEAT
+# 失败即重启（崩溃 / 退出码非 0 / 被杀），重启前 5 秒
 Restart=on-failure
 RestartSec=5
-# 防止守护了 5 次以上进入失败状态
 StartLimitIntervalSec=0
 StartLimitBurst=0
 
 # 环境清理与安全
-Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=false
