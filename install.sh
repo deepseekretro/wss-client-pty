@@ -22,6 +22,23 @@ BIN=/usr/local/bin/remote-bash-agent.py
 ENVFILE=/etc/remote-bash-agent.env
 UNIT=remote-bash-agent.service
 RAW=https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main
+# 多个下载源，raw.githubusercontent 不可用时自动回退
+SOURCES=(
+  "https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main"
+  "https://cdn.jsdelivr.net/gh/deepseekretro/wss-client-pty@main"
+  "https://github.com/deepseekretro/wss-client-pty/raw/main"
+)
+
+fetch() {
+  # $1 = 仓库内相对路径, $2 = 本地输出
+  local rel="$1" out="$2" src
+  for src in "${SOURCES[@]}"; do
+    if curl -fsSL "$src/$rel" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
 
 usage() {
   echo "用法:"
@@ -54,7 +71,7 @@ if ! command -v python3 >/dev/null; then
 fi
 
 echo "==> 下载 remote-bash-agent.py"
-curl -fsSL "$RAW/remote-bash-agent.py" -o "$BIN"
+fetch remote-bash-agent.py "$BIN" || { echo "下载脚本失败（所有源均不可用）" >&2; exit 1; }
 chmod +x "$BIN"
 python3 -m py_compile "$BIN"
 
@@ -70,7 +87,7 @@ EOF
 chmod 600 "$ENVFILE"
 
 echo "==> 安装 systemd 服务 $UNIT"
-curl -fsSL "$RAW/remote-bash-agent.service" -o "/etc/systemd/system/$UNIT"
+fetch remote-bash-agent.service "/etc/systemd/system/$UNIT" || { echo "下载 unit 失败" >&2; exit 1; }
 systemctl daemon-reload
 
 echo "==> 启用并启动"
