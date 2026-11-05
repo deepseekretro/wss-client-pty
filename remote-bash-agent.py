@@ -70,7 +70,7 @@ SCROLLBACK_LIMIT = SCROLLBACK_KB * 1024
 # daemon -> client 的初始回放分块（避免一次性几 MB 的帧）
 REPLAY_CHUNK = 256 * 1024
 HANDSHAKE_TIMEOUT = 15      # WebSocket 握手超时（秒）
-VERSION = '1.4.0'            # 客户端版本（服务端列表里可看出谁还是旧脚本）
+VERSION = '1.5.0'            # 客户端版本（服务端列表里可看出谁还是旧脚本）
 DEFAULT_HEARTBEAT = 15      # 秒
 # daemon -> client 发送队列水位：超过后暂停读 pty（pty 满则 shell 阻塞，不丢数据）
 CLIENT_HIGH_WATER = 512 * 1024
@@ -441,6 +441,98 @@ class DaemonTty:
 # --------------------------------------------------------------------------
 # WebSocket 客户端（复用已验证的实现：websocket-client 或手写帧）
 # --------------------------------------------------------------------------
+def _parse_proxy_url(proxy):
+    if not proxy:
+        return None
+    from urllib.parse import urlparse
+    p = proxy if '://' in proxy else 'http://' + proxy
+    u = urlparse(p)
+    if u.scheme not in ('http', 'https'):
+        raise ValueError(f'代理 scheme 仅支持 http/https: {u.scheme}')
+    return (u.hostname or '127.0.0.1', u.port or 3128)
+
+
+def open_tcp(host, port, proxy=None):
+    """建立到目标的 TCP（可能经 HTTP CONNECT 代理），返回 socket"""
+    pxy = _parse_proxy_url(proxy)
+    if not pxy:
+        return socket.create_connection((host, port), timeout=30)
+
+    phost, pport = pxy
+    sock = socket.create_connection((phost, pport), timeout=30)
+    sock.settimeout(30)
+    target = f'{host}:{port}'
+    sock.sendall(
+        f'CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: keep-alive\r\n\r\n'.encode()
+    )
+    buf = b''
+    while b'\r\n\r\n' not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            sock.close()
+            raise ConnectionError(f'代理 {phost}:{pport} 在 CONNECT 阶段断开')
+        buf += chunk
+    status = buf.split(b'\r\n', 1)[0].decode(errors='replace')
+    if ' 200 ' not in status:
+        sock.close()
+        raise ConnectionError(f'代理 CONNECT 失败: {status}')
+    sock.settimeout(None)
+    return sock
+
+
+def http_json(url, payload=None, method='POST', headers=None, proxy=None, timeout=30):
+    """极简 JSON HTTP 客户端（支持 http/https + 代理隧道，自签证书也接受）"""
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    secure = u.scheme == 'https'
+    port = u.port or (443 if secure else 80)
+    sock = open_tcp(u.hostname, port, proxy)
+    sock.settimeout(timeout)
+    try:
+        if secure:
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(sock, server_hostname=u.hostname)
+            sock.settimeout(timeout)
+        body = json.dumps(payload or {}).encode()
+        path = (u.path or '/') + (('?' + u.query) if u.query else '')
+        req = (
+            f'{method} {path} HTTP/1.1\r\n'
+            f'Host: {u.netloc}\r\n'
+            'Content-Type: application/json\r\n'
+            f'Content-Length: {len(body)}\r\n'
+            'Connection: close\r\n'
+        )
+        for k, v in (headers or {}).items():
+            req += f'{k}: {v}\r\n'
+        req += '\r\n'
+        sock.sendall(req.encode() + body)
+        buf = b''
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    head, _, rest = buf.partition(b'\r\n\r\n')
+    status = head.split(b'\r\n', 1)[0].decode(errors='replace')
+    try:
+        obj = json.loads(rest.decode('utf-8', 'replace') or '{}')
+    except ValueError:
+        obj = {}
+    code = 0
+    parts = status.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        code = int(parts[1])
+    return code, obj
+
+
 class WsClient:
     """
     零依赖最小 WebSocket 客户端：优先用 websocket-client（若已安装），
@@ -470,31 +562,7 @@ class WsClient:
         return (u.hostname or '127.0.0.1', u.port or 3128)
 
     def _open_tcp(self, host, port):
-        """建立到目标的 TCP（可能经 HTTP CONNECT 代理），返回 socket"""
-        proxy = self._parse_proxy()
-        if not proxy:
-            return socket.create_connection((host, port), timeout=30)
-
-        phost, pport = proxy
-        sock = socket.create_connection((phost, pport), timeout=30)
-        sock.settimeout(30)
-        target = f'{host}:{port}'
-        sock.sendall(
-            f'CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: keep-alive\r\n\r\n'.encode()
-        )
-        buf = b''
-        while b'\r\n\r\n' not in buf:
-            chunk = sock.recv(4096)
-            if not chunk:
-                sock.close()
-                raise ConnectionError(f'代理 {phost}:{pport} 在 CONNECT 阶段断开')
-            buf += chunk
-        status = buf.split(b'\r\n', 1)[0].decode(errors='replace')
-        if ' 200 ' not in status:
-            sock.close()
-            raise ConnectionError(f'代理 CONNECT 失败: {status}')
-        sock.settimeout(None)
-        return sock
+        return open_tcp(host, port, self.proxy)
 
     # ---- 连接 ----------------
     def connect(self):
@@ -860,6 +928,16 @@ class AgentLoop:
                 self.pending = b''
             else:
                 print(f'[remote-bash] 注册被拒: {m.get("error")}', file=sys.stderr)
+                if m.get('pairRequired') or 'token' in str(m.get('error') or ''):
+                    # token 失效/被吊销：清掉重新配对一次，然后让外层重连（不退出，避免 systemd 空转）
+                    # 60s 内只尝试一次，防止被拒后疯狂刷配对请求
+                    now_ts = time.time()
+                    if now_ts - getattr(self, '_last_repair', 0) > 60:
+                        self._last_repair = now_ts
+                        drop_token(self.name)
+                        tok = pair_device(self.url, self.name, self.proxy)
+                        if tok:
+                            self.token = tok
                 # 非 0 退出，配合 systemd Restart=on-failure 自动重试（例如 token 刚改过）
                 raise SystemExit(1)
         elif t == 'input':
@@ -1026,12 +1104,118 @@ def run_daemon(args):
     return 0
 
 
+# ---------------- 设备注册（配对，类似 tailscale up）----------------
+
+def token_path(name):
+    return os.path.join(state_dir(), f'{name}.token')
+
+
+def load_token(name):
+    try:
+        with open(token_path(name), 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def save_token(name, token):
+    p = token_path(name)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        try:
+            os.chmod(os.path.dirname(p), 0o700)
+        except OSError:
+            pass
+        tmp = p + '.tmp'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(token + '\n')
+        os.replace(tmp, p)
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+        return True
+    except OSError as e:
+        print(f'[remote-bash] 保存 token 失败: {e}', file=sys.stderr)
+        return False
+
+
+def drop_token(name):
+    try:
+        os.unlink(token_path(name))
+    except OSError:
+        pass
+
+
+def http_base(ws_url):
+    from urllib.parse import urlparse
+    u = urlparse(ws_url)
+    return f'{"https" if u.scheme == "wss" else "http"}://{u.netloc}'
+
+
+def pair_device(ws_url, name, proxy='', interval=2, timeout_sec=600):
+    """申请配对码 -> 打印链接 -> 等管理员在浏览器批准 -> 拿到并保存 token"""
+    base = http_base(ws_url)
+    try:
+        code, obj = http_json(
+            f'{base}/api/remote/pair/start',
+            {'name': name, 'host': socket.gethostname() or '',
+             'os': platform.system() or '', 'arch': platform.machine() or ''},
+            proxy=proxy,
+        )
+    except Exception as e:
+        print(f'[remote-bash] 申请配对码失败: {e}', file=sys.stderr)
+        return None
+    if code != 200 or not obj.get('success'):
+        print(f'[remote-bash] 申请配对码失败: HTTP {code} {obj.get("error", "")}', file=sys.stderr)
+        return None
+
+    url = obj.get('url') or f'{base}/workbench/?rb_pair={obj.get("code")}'
+    print('', flush=True)
+    print('=' * 66, flush=True)
+    print('  设备还没注册。用浏览器打开下面链接，点「允许」即可（像 tailscale 一样）：', flush=True)
+    print(f'    {url}', flush=True)
+    print(f'  配对码 {obj.get("code")}   有效期 {obj.get("expiresIn", 600)} 秒', flush=True)
+    print('  已经登录 workbench 的话不用再输密码；过期就重新运行安装脚本。', flush=True)
+    print('=' * 66, flush=True)
+
+    secret = obj.get('pollSecret', '')
+    deadline = time.time() + min(timeout_sec, int(obj.get('expiresIn') or 600))
+    while time.time() < deadline:
+        time.sleep(interval)
+        try:
+            _, r = http_json(f'{base}/api/remote/pair/poll', {'code': obj.get('code')},
+                             headers={'x-pair-secret': secret}, proxy=proxy)
+        except Exception as e:
+            print(f'[remote-bash] 查询配对结果失败（继续重试）: {e}', file=sys.stderr)
+            continue
+        st = r.get('status')
+        if st == 'approved' and r.get('token'):
+            save_token(name, r['token'])
+            print(f'[remote-bash] 注册成功：{name} 已授权，token -> {token_path(name)}', flush=True)
+            return r['token']
+        if st == 'denied':
+            print('[remote-bash] 管理员拒绝了这次注册', file=sys.stderr)
+            return None
+        if st == 'expired':
+            print('[remote-bash] 配对码已过期，请重试', file=sys.stderr)
+            return None
+    print('[remote-bash] 等待批准超时', file=sys.stderr)
+    return None
+
+
 def run_client(args):
     name = (args.name or socket.gethostname() or 'remote').strip() or 'remote'
     os_name = platform.system() or 'unknown'
     arch = platform.machine() or 'unknown'
     shell_cmd = args.shell or os.environ.get('REMOTE_BASH_SHELL') or ''
     sb_kb = max(16, int(getattr(args, 'scrollback', 0) or SCROLLBACK_KB))
+
+    token = (args.token or os.environ.get('REMOTE_BASH_TOKEN') or load_token(name)).strip()
+
+    if getattr(args, 'pair', False):
+        return 0 if pair_device(args.url, name, args.proxy) else 1
 
     if not ensure_daemon(name, shell_cmd, args.proxy, scrollback_kb=sb_kb):
         print('[remote-bash] 无法启动本地 daemon，退出', file=sys.stderr)
@@ -1050,7 +1234,10 @@ def run_client(args):
             print(f'[remote-bash] 使用 HTTP 代理: {args.proxy}')
         print(f'[remote-bash] 心跳间隔: {args.heartbeat}s')
 
-        loop = AgentLoop(tty_, args.url, args.token, args.proxy, name,
+        if not token:
+            # 没注册过：自动走配对（链接打到 stdout / journal，install.sh 也会转述）
+            token = pair_device(args.url, name, args.proxy) or ''
+        loop = AgentLoop(tty_, args.url, token, args.proxy, name,
                          socket.gethostname() or '', os_name, arch, args.heartbeat,
                          shell=shell_cmd, scrollback_limit=sb_kb * 1024)
         code = loop.run()
@@ -1076,6 +1263,8 @@ def main():
                     help=f'心跳间隔秒数（默认 {DEFAULT_HEARTBEAT}s，保持长连接）')
     ap.add_argument('--no-daemon', action='store_true',
                     help='不自动拉起 daemon（要求 daemon 已在前台运行）')
+    ap.add_argument('--pair', action='store_true',
+                    help='只做设备注册：打印链接、等管理员批准、保存 token 后退出')
     ap.add_argument('--daemon', action='store_true', help='以前台 daemon 模式运行（持有 tty）')
     args = ap.parse_args()
 

@@ -94,6 +94,36 @@ systemctl restart remote-bash-agent     # 重启
    - 改了 `--scrollback` 需要重建 daemon 才生效：`systemctl stop remote-bash-agent && pkill -f 'remote-bash-agent.py --daemon --name <名称>'`，再 `systemctl start remote-bash-agent`。
 6. **稳定客户端 id**：id 由 `名称 + 主机名` 哈希得出，重连后不变，浏览器面板可自动接回原客户端（不用重新点卡片）。
 
+## 安装后怎么注册（不用手工拷 token）
+
+安装脚本跑完会直接打印一个链接（像 `tailscale up` 那样）：
+
+```
+==================================================================
+  设备还没注册。用浏览器打开下面链接，点「允许」即可（像 tailscale 一样）：
+    https://edge02.10w123.com/workbench/?rb_pair=6SDD-8FFU
+  配对码 6SDD-8FFU   有效期 600 秒
+==================================================================
+```
+
+1. 在浏览器打开这个链接（已经登录过 workbench 就不用再输密码）；
+2. 弹窗里核对 名称/主机/系统/IP，点 **允许接入**；
+3. 客户端自己拿到 token，存到 `~/.remote-bash/<名称>.token`（0600），随后正常上线。
+
+想重新注册（换了机器名、token 被吊销）：
+
+```bash
+sudo remote-bash-agent.py --pair --name 名称
+```
+
+几点说明：
+
+- 服务端把每个设备的 token 存成 sha256（`data/remote-bash-devices.json`，0600），可用
+  `GET /api/remote/devices` 查看、`DELETE /api/remote/devices/<id>` 吊销；吊销后客户端会在 60s 内自动重新发起配对。
+- 老的客户端脚本（不会配对）也不会被一刀切：它被拒时会登记成一条待批准记录，管理员在弹窗里点允许后按 `名称+主机名` 放行（列表里显示 `tokenless`）。升级到新版后就会走 token。
+- 不想启用门禁：服务端设 `REMOTE_BASH_REQUIRE_TOKEN=0`（默认开启）。也仍支持 `REMOTE_BASH_TOKEN` 静态口令兜底。
+- 配对码 10 分钟过期；`/api/remote/pair/start` 与 `/api/remote/pair/poll` 在 nginx 上免 Basic Auth（靠一次性码 + pollSecret），而 `approve/deny` 必须登录通过。
+
 ## 两个入口的分工（安全相关）
 
 服务端有两个 WebSocket 入口，**角色是强制校验的**，走错入口会被 1008 关闭：

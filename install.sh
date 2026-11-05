@@ -90,6 +90,21 @@ echo "==> 安装 systemd 服务 $UNIT"
 fetch remote-bash-agent.service "/etc/systemd/system/$UNIT" || { echo "下载 unit 失败" >&2; exit 1; }
 systemctl daemon-reload
 
+if [ -z "$TOKEN" ]; then
+  echo "==> 设备注册（不进 systemd，先在前台拿 token）"
+  echo "    稍后会打印一个链接，用浏览器打开并点「允许」即可，无需手工填 token。"
+  set +e
+  python3 "$BIN" --pair ${NAME:+--name "$NAME"} --url "$URL" ${PROXY:+--proxy "$PROXY"} </dev/null
+  PAIR_RC=$?
+  set -e
+  if [ "$PAIR_RC" != "0" ]; then
+    echo
+    echo "⚠ 这次没完成注册（超时/被拒/网络不通）。服务启动后会继续尝试，"
+    echo "  注册链接在日志里：journalctl -u $UNIT -n 20 --no-pager | grep rb_pair"
+    echo "  也可以随时手工重来：$BIN --pair ${NAME:+--name $NAME} --url $URL"
+  fi
+fi
+
 echo "==> 启用并启动"
 systemctl enable --now "$UNIT" || true
 sleep 2
@@ -100,6 +115,7 @@ echo "✔ 安装完成。管理："
 echo "  systemctl status  $UNIT        # 查看状态"
 echo "  journalctl -u $UNIT -f         # 实时日志"
 echo "  systemctl edit    $UNIT        # 修改参数（或编辑 $ENVFILE 后 systemctl restart $UNIT）"
+echo "  重新注册/换 token: $BIN --pair ${NAME:+--name $NAME} --url $URL"
 echo "  systemctl restart $UNIT        # 只重启客户端，不会打断/杀死 tty 里正在跑的任务"
 echo "  彻底结束某会话: systemctl stop $UNIT && pkill -f 'remote-bash-agent.py --daemon --name 名称'"
 echo "  名称: ${NAME:-<主机名>}  地址: $URL  心跳: ${HEARTBEAT}s${PROXY:+  代理: $PROXY}"
