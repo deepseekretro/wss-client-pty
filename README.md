@@ -74,6 +74,7 @@ systemctl restart remote-bash-agent     # 重启
 2. daemon 里 `pty.fork()` 出来的 shell 进程与 agent 完全独立。
 3. agent 崩溃 / 系统重启 agent 服务 → shell 不受影响（daemon 仍在）。
 4. agent 再次启动 → 重新连回同一 daemon → 接回 shell 会话，继续输入输出。
+5. **屏幕内容回放**：daemon 保留最近 256KB 输出，新 agent 连上来先补发；agent 注册成功后会把历史发给服务端；服务端为新 attach 的 viewer 回放。所以断连重连、甚至 agent 进程重启后，浏览器打开 remote bash 仍能看到断线前的屏幕，不会只剩“已连接”。
 
 ## 协议简述
 
