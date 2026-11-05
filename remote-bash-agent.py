@@ -86,6 +86,18 @@ class TtyDaemon:
         pid, master = pty.fork()
         if pid == 0:
             env = os.environ.copy()
+            # systemd system 服务不设置 HOME/USER/LOGNAME，补全基础变量，
+            # 否则 shell 里用到 $HOME 的脚本（如 Pi Installer）报
+            # "HOME: parameter not set"。
+            try:
+                import pwd
+                pw = pwd.getpwuid(os.getuid())
+                env.setdefault('HOME', pw.pw_dir)
+                env.setdefault('USER', pw.pw_name)
+                env.setdefault('LOGNAME', pw.pw_name)
+            except Exception:
+                env.setdefault('HOME', os.path.expanduser('~') or '/')
+            env.setdefault('SHELL', self.shell_cmd)
             env['TERM'] = env.get('TERM', 'xterm-256color')
             env['LANG'] = env.get('LANG', 'C.UTF-8')
             os.execvpe(self.shell_cmd, [self.shell_cmd], env)
@@ -711,12 +723,13 @@ def daemon_log(name):
     return os.path.join(state_dir(), f'{safe}.daemon.log')
 
 
-def spawn_daemon(name, shell_cmd):
-    """后台拉起 daemon 进程（与当前进程脱离），返回是否成功。"""
+def spawn_daemon(name, shell_cmd, proxy=''):
+    """后台拉起 daemon 进程（与当前进程脱离），返回是否成功。
+    proxy: HTTP 代理（如 http://127.0.0.1:3128），传给 daemon 注入其 shell 环境。"""
     try:
         proc = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), '--daemon', '--name', name,
-             '--shell', shell_cmd or ''],
+             '--shell', shell_cmd or '', '--proxy', proxy or ''],
             stdin=subprocess.DEVNULL,
             stdout=open(daemon_log(name), 'a'),
             stderr=subprocess.STDOUT,
@@ -744,7 +757,7 @@ def is_daemon_alive(name):
         return False
 
 
-def ensure_daemon(name, shell_cmd, max_wait=8):
+def ensure_daemon(name, shell_cmd, proxy='', max_wait=8):
     """保证 daemon 就绪：活着则直接返回；否则拉起并等待 socket。"""
     if is_daemon_alive(name):
         return True
@@ -755,7 +768,7 @@ def ensure_daemon(name, shell_cmd, max_wait=8):
             os.unlink(path)
     except OSError:
         pass
-    if not spawn_daemon(name, shell_cmd):
+    if not spawn_daemon(name, shell_cmd, proxy):
         return False
     deadline = time.time() + max_wait
     while time.time() < deadline:
@@ -765,10 +778,31 @@ def ensure_daemon(name, shell_cmd, max_wait=8):
     return False
 
 
+def inject_proxy_env(proxy):
+    """把会话配置的 HTTP 代理展开为标准代理环境变量，注入 daemon 环境。
+    daemon 的 shell 由 pty.fork() 继承 os.environ（_spawn_shell 里 copy），
+    因此 shell 及其所有子进程（git/curl/pip/npm 等）都会自动走该代理。
+    NO_PROXY 确保 localhost / 本机地址不经过代理，避免误伤本机服务。"""
+    if not proxy:
+        return
+    os.environ.setdefault('REMOTE_BASH_PROXY', proxy)
+    for key in ('http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY',
+                'all_proxy', 'ALL_PROXY'):
+        os.environ.setdefault(key, proxy)
+    merged = os.environ.get('no_proxy') or os.environ.get('NO_PROXY') or ''
+    merged = merged.strip(',')
+    if not any(h in merged for h in ('localhost', '127.0.0.1', '::1')):
+        merged += (',' if merged else '') + 'localhost,127.0.0.1,::1'
+    os.environ.setdefault('no_proxy', merged)
+    os.environ.setdefault('NO_PROXY', merged)
+
+
 def run_daemon(args):
     """--daemon 模式：常驻持有 tty，直到 shell 退出"""
     # 忽略 SIGCHLD 噪声由 waitpid 处理；Ctrl+C 直接退出
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    # 启动 shell 前先注入代理环境变量（--proxy 默认读 REMOTE_BASH_PROXY）
+    inject_proxy_env(args.proxy)
     d = TtyDaemon(daemon_path(args.name), args.shell or (os.environ.get('SHELL') or '/bin/bash'),
                   log_file=daemon_log(args.name))
     try:
@@ -789,7 +823,7 @@ def run_client(args):
     os_name = platform.system() or 'unknown'
     arch = platform.machine() or 'unknown'
 
-    if not ensure_daemon(name, args.shell):
+    if not ensure_daemon(name, args.shell, args.proxy):
         print('[remote-bash] 无法启动本地 daemon，退出', file=sys.stderr)
         return 2
 

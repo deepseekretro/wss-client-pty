@@ -12,7 +12,7 @@
 
 - **daemon 架构**：常驻 daemon 进程持有 shell(tty)。客户端(agent)只是桥——**agent 退出 / 崩溃 / 重启，shell 会话仍在继续**，下次启动自动接回同一个会话，正在跑的命令不会中断。
 - **15 秒心跳**默认，保持长连接不被代理 / NAT 掐断（`--heartbeat` 可调）。
-- **HTTP 代理**支持（`--proxy http://127.0.0.1:3128`，走 CONNECT 隧道）。
+- **HTTP 代理**支持（`--proxy http://127.0.0.1:3128`，走 CONNECT 隧道），且会注入持久 shell 环境：daemon 拉起的 shell 及其子进程（git/curl/pip/npm）自动走该代理，`NO_PROXY=localhost,127.0.0.1,::1` 避免本机流量被劫持。（已运行的旧 daemon 需重启服务重建：`systemctl restart remote-bash-agent`）
 - **断线重连**：指数退避自动重连；断线期间 tty 输出暂存在内存（上限 1MB）后补发。
 - **可选 token 鉴权**（服务端 `REMOTE_BASH_TOKEN`，客户端 `--token`）。
 - 零依赖：标准库 `socket + ssl` 手写 WebSocket 帧，任何机器有 python3 就能跑；装了 `websocket-client` 则走库。
@@ -57,7 +57,7 @@ systemctl restart remote-bash-agent     # 重启
 | `--name` | `REMOTE_BASH_NAME` | 主机名 | 客户端显示名 = 会话名，daemon 按它持久化 |
 | `--url` | `REMOTE_BASH_URL` | `wss://edge02.10w123.com/workbench/wss` | workbench WebSocket 地址 |
 | `--token` | `REMOTE_BASH_TOKEN` | 空 | 可选鉴权口令（服务端必须相同） |
-| `--proxy` | `REMOTE_BASH_PROXY` / `http_proxy` | 空 | HTTP 代理（CONNECT 隧道） |
+| `--proxy` | `REMOTE_BASH_PROXY` / `http_proxy` | 空 | HTTP 代理（CONNECT 隧道）；同时注入持久 shell 环境（`http_proxy`/`https_proxy`/`NO_PROXY`），shell 内 git/curl/pip 自动走代理 |
 | `--heartbeat` | `REMOTE_BASH_HEARTBEAT` | 15 | 心跳间隔秒 |
 | `--shell` | `REMOTE_BASH_SHELL` | `$SHELL`/`/bin/bash` | 远端 shell（Windows 可 `--shell powershell`） |
 | `--daemon` | — | — | 只跑常驻 daemon（持有 tty） |
