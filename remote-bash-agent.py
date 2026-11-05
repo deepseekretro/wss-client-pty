@@ -31,6 +31,7 @@ import base64
 import json
 import os
 import platform
+import random
 import select
 import signal
 import socket
@@ -57,6 +58,10 @@ RECONNECT_MAX = 30.0
 BUFFER_LIMIT = 1024 * 1024  # 断线暂存上限 1MB
 SCROLLBACK_LIMIT = 256 * 1024  # 最近输出回放缓冲上限 256KB（daemon/client/server 一致）
 DEFAULT_HEARTBEAT = 15      # 秒
+# daemon -> client 发送队列水位：超过后暂停读 pty（pty 满则 shell 阻塞，不丢数据）
+CLIENT_HIGH_WATER = 512 * 1024
+# 单个 client 积压硬上限：只可能是卡死的客户端，断开它（重连会靠回放重新对齐）
+CLIENT_OUTBUF_LIMIT = 8 * 1024 * 1024
 
 # ---------- 本地 daemon 帧协议 ----------
 FRAME_DATA = 0x01   # payload: 裸 tty 字节
@@ -76,10 +81,10 @@ class TtyDaemon:
         self.log_file = log_file
         self.master = None
         self.pid = None
-        self.clients = []       # [(sock, read_buf)]
+        self.clients = []       # [(sock, read_buf, write_buf)]
         self.server = None
         self._buf = b''
-        self.scrollback = b''   # 最近输出，用于新 client 连接时回放（保持屏幕内容）
+        self.scrollback = bytearray()   # 最近输出，用于新 client 连接时回放（保持屏幕内容）
 
     # ---- pty ----
     def _spawn_shell(self):
@@ -126,6 +131,11 @@ class TtyDaemon:
         self.server.bind(self.sock_path)
         self.server.listen(8)
         self.server.setblocking(False)
+        # 只有当前用户能连 daemon（daemon 持有的是登录 shell）
+        try:
+            os.chmod(self.sock_path, 0o600)
+        except OSError:
+            pass
 
     # ---- 帧编解码 ----
     @staticmethod
@@ -149,74 +159,108 @@ class TtyDaemon:
         self._start_socket()
         self._log(f'daemon 启动: shell={self.shell_cmd} pid={self.pid} sock={self.sock_path}')
 
-        readers = [self.server, self.master]
         while True:
+            # 反压：有 client 严重积压时暂停读 master（pty 满后 shell 自然阻塞，不丢数据）
+            backlog = max((len(p[2]) for p in self.clients), default=0)
+            watch_read = [self.server] if backlog > CLIENT_HIGH_WATER else [self.server, self.master]
+            watch_read += [p[0] for p in self.clients]
+            watch_write = [p[0] for p in self.clients if p[2]]
             try:
-                ready, _, _ = select.select(readers, [], [], 1.0)
+                ready, writable, _ = select.select(watch_read, watch_write, [], 1.0)
             except (OSError, ValueError):
                 break
 
             for fd in ready:
                 if fd is self.server:
-                    try:
-                        conn, _ = self.server.accept()
-                    except OSError:
-                        continue
-                    # 新 client 接入：先回放最近输出（保持断连/重启后屏幕不空）
-                    if self.scrollback:
-                        try:
-                            conn.settimeout(5)
-                            conn.sendall(self.encode_frame(FRAME_DATA, self.scrollback))
-                        except OSError:
-                            pass
-                    conn.setblocking(False)
-                    self.clients.append([conn, b''])
-                    readers.append(conn)
+                    self._accept()
                 elif fd is self.master:
-                    try:
-                        data = os.read(self.master, 65536)
-                    except BlockingIOError:
-                        continue
-                    except OSError:
-                        data = None
-                    if data:
-                        # 累积最近输出供回放（环形，上限 SCROLLBACK_LIMIT）
-                        self.scrollback = (self.scrollback + data)[-SCROLLBACK_LIMIT:]
-                        frame = self.encode_frame(FRAME_DATA, data)
-                        for pair in list(self.clients):
-                            try:
-                                pair[0].sendall(frame)
-                            except OSError:
-                                pass
-                    # master 读不到 & 子进程已退出 -> daemon 结束
-                    if not data and not self._shell_alive():
-                        self._log('shell 已退出，daemon 退出')
-                        return
+                    self._pump_master()
                 else:
-                    # client socket 可读
-                    try:
-                        chunk = fd.recv(65536)
-                    except (OSError, BlockingIOError):
-                        chunk = b''
-                    if not chunk:
-                        self._drop_client(fd, readers)
-                        continue
-                    pair = next((p for p in self.clients if p[0] is fd), None)
-                    if pair is None:
-                        continue
-                    pair[1] += chunk
-                    while True:
-                        got = self.recv_frame(fd, pair[1])
-                        if got is None:
-                            break
-                        ftype, payload, pair[1] = got
-                        if ftype == FRAME_DATA and payload:
-                            self._write_master(payload)
-                        elif ftype == FRAME_RESIZE and len(payload) >= 4:
-                            cols, rows = struct.unpack('<HH', payload[:4])
-                            self._set_winsize(cols, rows)
-                        elif ftype == FRAME_HELLO:
-                            self._log(f'client 接入: {payload.decode("utf-8", "replace")}')
+                    self._read_client(fd)
+
+            # 写就绪：把积压的帧尽量发出去（非阻塞，发不完下一轮继续）
+            for fd in writable:
+                self._flush_client(fd)
+
+            # master 读不到 & 子进程已退出 -> daemon 结束
+            if not self._shell_alive():
+                self._log('shell 已退出，daemon 退出')
+                return
+
+    def _accept(self):
+        try:
+            conn, _ = self.server.accept()
+        except OSError:
+            return
+        conn.setblocking(False)
+        # 新 client 接入：先回放最近输出（保持断连/重启后屏幕不空）
+        replay = self.encode_frame(FRAME_DATA, bytes(self.scrollback)) if self.scrollback else b''
+        self.clients.append([conn, b'', replay])
+        self._flush_client(conn)
+
+    def _pump_master(self):
+        try:
+            data = os.read(self.master, 65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b''
+        if not data:
+            return
+        # 累积最近输出供回放（环形，上限 SCROLLBACK_LIMIT）
+        self.scrollback += data
+        over = len(self.scrollback) - SCROLLBACK_LIMIT
+        if over > 0:
+            del self.scrollback[:over]
+        frame = self.encode_frame(FRAME_DATA, data)
+        for pair in list(self.clients):
+            if len(pair[2]) > CLIENT_OUTBUF_LIMIT:
+                # 积压超限：客户端卡死/极慢，断开它（重连后靠回放重新对齐，不会静默丢块）
+                self._drop_client(pair[0])
+                continue
+            pair[2] += frame
+            self._flush_client(pair[0])
+
+    def _read_client(self, fd):
+        pair = next((p for p in self.clients if p[0] is fd), None)
+        if pair is None:
+            return
+        try:
+            chunk = fd.recv(65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            chunk = b''
+        if not chunk:
+            self._drop_client(fd)
+            return
+        pair[1] += chunk
+        while True:
+            got = self.recv_frame(fd, pair[1])
+            if got is None:
+                break
+            ftype, payload, pair[1] = got
+            if ftype == FRAME_DATA and payload:
+                self._write_master(payload)
+            elif ftype == FRAME_RESIZE and len(payload) >= 4:
+                cols, rows = struct.unpack('<HH', payload[:4])
+                self._set_winsize(cols, rows)
+            elif ftype == FRAME_HELLO:
+                self._log(f'client 接入: {payload.decode("utf-8", "replace")}')
+
+    def _flush_client(self, fd):
+        """非阻塞发送：发出多少算多少，剩下的留在队列里，等 select 写就绪继续。"""
+        pair = next((p for p in self.clients if p[0] is fd), None)
+        if pair is None or not pair[2]:
+            return
+        try:
+            n = fd.send(pair[2])
+            if n:
+                pair[2] = pair[2][n:]
+        except BlockingIOError:
+            pass
+        except OSError:
+            self._drop_client(fd)
 
     def _write_master(self, data):
         if self.master is None:
@@ -235,14 +279,12 @@ class TtyDaemon:
         except ChildProcessError:
             return False
 
-    def _drop_client(self, fd, readers):
+    def _drop_client(self, fd):
         self.clients = [p for p in self.clients if p[0] is not fd]
         try:
             fd.close()
         except OSError:
             pass
-        if fd in readers:
-            readers.remove(fd)
 
     def _log(self, msg):
         line = f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}'
@@ -489,11 +531,23 @@ class WsClient:
         return self.send_text(json.dumps(obj, ensure_ascii=False))
 
     # ---- 接收 ----------------
+    def poll(self, timeout=0.0):
+        """底层 socket 是否可读（用于非阻塞轮询，避免 settimeout(0) 抛 BlockingIOError）"""
+        sock = self.ws.sock if self.ws is not None else self.raw
+        if sock is None:
+            return False
+        try:
+            r, _, _ = select.select([sock], [], [], max(0.0, float(timeout or 0)))
+            return bool(r)
+        except (OSError, ValueError):
+            return False
+
     def recv_text(self, timeout=15):
-        """阻塞接收一帧，返回其文本；断线/关闭抛 ConnectionError"""
+        """等待并读取一条文本消息；超时抛 TimeoutError，断线抛 ConnectionError。
+        timeout=0 表示只轮询不等待。"""
+        if not self.poll(timeout):
+            raise TimeoutError
         if self.ws is not None:
-            if timeout:
-                self.ws.settimeout(timeout)
             try:
                 raw = self.ws.recv()
             except Exception as e:
@@ -504,7 +558,7 @@ class WsClient:
 
         if self.raw is None:
             raise ConnectionError('未连接')
-        self.raw.settimeout(timeout)
+        self.raw.settimeout(15)
         try:
             return self._recv_raw()
         except socket.timeout:
@@ -598,7 +652,7 @@ class WsClient:
 # 事件循环：tty(daemon) <-> wss 双向 + 心跳
 # --------------------------------------------------------------------------
 class AgentLoop:
-    def __init__(self, tty_, url, token, proxy, name, host, os_name, arch, heartbeat):
+    def __init__(self, tty_, url, token, proxy, name, host, os_name, arch, heartbeat, shell=''):
         self.tty = tty_
         self.url = url
         self.token = token
@@ -608,14 +662,33 @@ class AgentLoop:
         self.os_name = os_name
         self.arch = arch
         self.heartbeat = heartbeat
+        self.shell = shell
         self.ws = None
         self.pending = b''
-        self.history = b''   # 最近 tty 输出，重连后先补发给服务端回放
+        self.history = bytearray()   # 最近 tty 输出，重连后先补发给服务端回放
         self.registered = False
+        self.ok_count = 0            # 注册成功次数（用于判断是否真的连上 past）
         self.last_beat = 0.0
 
     def run(self):
+        code = 0
+        backoff = RECONNECT_BASE
         while True:
+            # daemon 崩了/被杀了：重建后再连，否则会永远连不上 tty（只会空转重连）
+            if not self.tty.is_alive():
+                try:
+                    self.tty.close()
+                    if not ensure_daemon(self.name, self.shell, self.proxy):
+                        raise OSError('ensure_daemon 失败')
+                    self.tty.open()
+                    print('[remote-bash] 本地 daemon 已重建，会话恢复')
+                except Exception as e:
+                    print(f'[remote-bash] 重建 daemon 失败: {e}', file=sys.stderr)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, RECONNECT_MAX)
+                    continue
+
+            ok_before = self.ok_count
             try:
                 self.ws = WsClient(self.url, self.token, self.proxy)
                 self.ws.connect()
@@ -624,13 +697,16 @@ class AgentLoop:
                     'type': 'hello', 'role': 'agent',
                     'name': self.name, 'host': self.host,
                     'os': self.os_name, 'arch': self.arch,
+                    'heartbeat': self.heartbeat,
                     'token': self.token or None,
                 })
                 self.last_beat = time.time()
                 self._loop_once_many()
             except KeyboardInterrupt:
                 break
-            except SystemExit:
+            except SystemExit as e:
+                c = getattr(e, 'code', 0)
+                code = c if isinstance(c, int) else (0 if c is None else 1)
                 break
             except Exception as e:
                 print(f'[remote-bash] 错误: {e}', file=sys.stderr)
@@ -643,25 +719,39 @@ class AgentLoop:
                     self.ws = None
                 self.registered = False
 
+            # 指数退避 + 抖动：服务端重启时避免所有客户端同时重连/补发历史
+            if self.ok_count > ok_before:
+                backoff = RECONNECT_BASE
             print('[remote-bash] 连接已断开，重连中...')
-            time.sleep(RECONNECT_BASE)
+            time.sleep(backoff * (0.8 + 0.4 * random.random()))
+            backoff = min(backoff * 2, RECONNECT_MAX)
+        return code
 
     def _loop_once_many(self):
         """持续运行：tty 输出 -> wss；wss 消息 -> tty；心跳"""
         while True:
-            # 1. tty 输出
-            out = self.tty.read()
-            if out:
-                self.history = (self.history + out)[-SCROLLBACK_LIMIT:]
+            # 1. 排空 tty：一次最多读 16 块（约 1MB），避免每轮只读一块被 ws 轮询限速
+            got_data = False
+            for _ in range(16):
+                out = self.tty.read()
+                if not out:
+                    break
+                got_data = True
+                self.history += out
+                over = len(self.history) - SCROLLBACK_LIMIT
+                if over > 0:
+                    del self.history[:over]
                 self.pending += out
                 if len(self.pending) > BUFFER_LIMIT:
                     self.pending = self.pending[-BUFFER_LIMIT:]
                 if self.registered:
                     self._flush()
+                    if self.pending:   # 发送失败 -> 断线，交给外层重连
+                        return
 
-            # 2. wss 消息（短超时轮询）
+            # 2. wss 消息：有 tty 数据时非阻塞轮询，空闲时才短超时等待
             try:
-                raw = self.ws.recv_text(timeout=0.1)
+                raw = self.ws.recv_text(timeout=0 if got_data else 0.1)
             except TimeoutError:
                 raw = None
             except Exception:
@@ -700,16 +790,18 @@ class AgentLoop:
         if t == 'hello':
             if m.get('ok'):
                 self.registered = True
+                self.ok_count += 1
                 self.last_beat = time.time()
                 print(f'[remote-bash] 注册成功 id={m.get("id")} name={m.get("name")}')
                 # 先回放最近输出（让服务端/新 viewer 看到当前屏幕），再继续实时流。
                 # history 包含 pending 内容，所以回放后清空 pending 避免重复。
                 if self.history:
-                    self.ws.send({'type': 'data', 'data': base64.b64encode(self.history).decode()})
+                    self.ws.send({'type': 'data', 'data': base64.b64encode(bytes(self.history)).decode()})
                 self.pending = b''
             else:
                 print(f'[remote-bash] 注册被拒: {m.get("error")}', file=sys.stderr)
-                raise SystemExit
+                # 非 0 退出，配合 systemd Restart=on-failure 自动重试（例如 token 刚改过）
+                raise SystemExit(1)
         elif t == 'input':
             data = m.get('data', '')
             try:
@@ -729,6 +821,10 @@ class AgentLoop:
         elif t == 'bye':
             print('[remote-bash] 服务端要求退出')
             raise SystemExit
+        elif t == 'replaced':
+            print(f'[remote-bash] 同名客户端已从别处重连（{m.get("reason") or ""}），本进程退出以免抢连接',
+                  file=sys.stderr)
+            raise SystemExit(0)
 
 
 # --------------------------------------------------------------------------
@@ -737,7 +833,12 @@ class AgentLoop:
 def state_dir():
     d = os.environ.get('REMOTE_BASH_STATE', os.path.join(os.path.expanduser('~'), '.remote-bash'))
     try:
-        os.makedirs(d, exist_ok=True)
+        os.makedirs(d, exist_ok=True, mode=0o700)
+    except OSError:
+        pass
+    # 目录里是持有登录 shell 的 unix socket，只允许当前用户访问
+    try:
+        os.chmod(d, 0o700)
     except OSError:
         pass
     return d
@@ -845,7 +946,9 @@ def run_daemon(args):
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     # 启动 shell 前先注入代理环境变量（--proxy 默认读 REMOTE_BASH_PROXY）
     inject_proxy_env(args.proxy)
-    d = TtyDaemon(daemon_path(args.name), args.shell or (os.environ.get('SHELL') or '/bin/bash'),
+    d = TtyDaemon(daemon_path(args.name),
+                  args.shell or os.environ.get('REMOTE_BASH_SHELL')
+                  or (os.environ.get('SHELL') or '/bin/bash'),
                   log_file=daemon_log(args.name))
     try:
         d.run()
@@ -864,12 +967,14 @@ def run_client(args):
     name = (args.name or socket.gethostname() or 'remote').strip() or 'remote'
     os_name = platform.system() or 'unknown'
     arch = platform.machine() or 'unknown'
+    shell_cmd = args.shell or os.environ.get('REMOTE_BASH_SHELL') or ''
 
-    if not ensure_daemon(name, args.shell, args.proxy):
+    if not ensure_daemon(name, shell_cmd, args.proxy):
         print('[remote-bash] 无法启动本地 daemon，退出', file=sys.stderr)
         return 2
 
     tty_ = DaemonTty(daemon_path(name))
+    code = 0
     try:
         try:
             tty_.open()
@@ -882,11 +987,12 @@ def run_client(args):
         print(f'[remote-bash] 心跳间隔: {args.heartbeat}s')
 
         loop = AgentLoop(tty_, args.url, args.token, args.proxy, name,
-                         socket.gethostname() or '', os_name, arch, args.heartbeat)
-        loop.run()
+                         socket.gethostname() or '', os_name, arch, args.heartbeat,
+                         shell=shell_cmd)
+        code = loop.run()
     finally:
         tty_.close()
-    return 0
+    return code
 
 
 def main():

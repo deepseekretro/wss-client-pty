@@ -13,8 +13,11 @@
 - **daemon 架构**：常驻 daemon 进程持有 shell(tty)。客户端(agent)只是桥——**agent 退出 / 崩溃 / 重启，shell 会话仍在继续**，下次启动自动接回同一个会话，正在跑的命令不会中断。
 - **15 秒心跳**默认，保持长连接不被代理 / NAT 掐断（`--heartbeat` 可调）。
 - **HTTP 代理**支持（`--proxy http://127.0.0.1:3128`，走 CONNECT 隧道），且会注入持久 shell 环境：daemon 拉起的 shell 及其子进程（git/curl/pip/npm）自动走该代理，`NO_PROXY=localhost,127.0.0.1,::1` 避免本机流量被劫持。（已运行的旧 daemon 需重启服务重建：`systemctl restart remote-bash-agent`）
-- **断线重连**：指数退避自动重连；断线期间 tty 输出暂存在内存（上限 1MB）后补发。
-- **可选 token 鉴权**（服务端 `REMOTE_BASH_TOKEN`，客户端 `--token`）。
+- **断线重连**：指数退避 + 抖动（2s → 30s，`RECONNECT_MAX`），连上后自动重置；断线期间 tty 输出暂存在内存（上限 1MB）后补发。
+- **daemon 崩了会自愈**：agent 发现本地 daemon 消失会自动重新拉起（无需人工介入，`systemctl restart` 都不用）。
+- **大输出不丢数据**：daemon 给每个 client 维护独立发送队列 + select 写就绪 + 反压（积压时暂停读 pty，由 pty 让 shell 自然阻塞），实测 `seq 1 300000`（≈2.3MB）**零丢块**、吞吐约 1–2MB/s。
+- **可选 token 鉴权**（服务端 `REMOTE_BASH_TOKEN`，客户端 `--token`；浏览器侧用 `REMOTE_BASH_VIEWER_TOKEN`）。
+- **同名去重**：同一台机器同名重连会替换旧连接（并让旧进程退出），不会再出现"幽灵卡片"。
 - 零依赖：标准库 `socket + ssl` 手写 WebSocket 帧，任何机器有 python3 就能跑；装了 `websocket-client` 则走库。
 
 ## 快速开始（远端机器）
@@ -75,10 +78,11 @@ systemctl restart remote-bash-agent     # 重启
 3. agent 崩溃 / 系统重启 agent 服务 → shell 不受影响（daemon 仍在）。
 4. agent 再次启动 → 重新连回同一 daemon → 接回 shell 会话，继续输入输出。
 5. **屏幕内容回放**：daemon 保留最近 256KB 输出，新 agent 连上来先补发；agent 注册成功后会把历史发给服务端；服务端为新 attach 的 viewer 回放。所以断连重连、甚至 agent 进程重启后，浏览器打开 remote bash 仍能看到断线前的屏幕，不会只剩“已连接”。
+6. **稳定客户端 id**：id 由 `名称 + 主机名` 哈希得出，重连后不变，浏览器面板可自动接回原客户端（不用重新点卡片）。
 
 ## 协议简述
 
-- **wss 端**（与 server `remote-bash.js` 一致）：JSON 文本帧。`hello(agent)` → 服务端回 `hello{ok}`；`data(base64)` 双向传 tty；`input`/`resize`/`ping`/`pong`。
+- **wss 端**（与 server `remote-bash.js` 一致）：JSON 文本帧。`hello(agent, name, host, os, arch, heartbeat, token?)` → 服务端回 `hello{ok, id, name}`；`data(base64)` 双向传 tty；`input`/`resize`/`ping`/`pong`；服务端在“同名重连替换旧连接”时发 `{type:'replaced'}`，被替换的 agent 主动退出（避免来回抢连接）。
 - **本地 unix socket**：长度前缀帧 `[1B type][4B len][payload]`；`0x01` 数据、`0x02` resize、`0x03` hello。
 
 ## License
