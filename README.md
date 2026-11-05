@@ -106,8 +106,11 @@ docker run -d --name rb-agent --restart=unless-stopped \
 不用域名、不用证书，装完直接打印 `vless://` 连接地址：
 
 ```bash
-bash -c "$(curl -fsSL https://cdn.jsdelivr.net/gh/deepseekretro/wss-client-pty@main/install-xray-xhttp.sh)" --port 8443
+curl -fsSL https://cdn.jsdelivr.net/gh/deepseekretro/wss-client-pty@main/install-xray-xhttp.sh | bash -s -- --port 8443
 ```
+
+> 注意别写成 `bash -c "$(curl ...)" --port 8443`：bash 会把第一个参数当成 `$0` 吃掉，
+> 脚本收到的是孤零零的 `8443`，会直接打印用法退出。（新版脚本已兼容这种写法，但推荐上面这种。）
 
 - 自动生成 UUID / x25519 密钥 / shortId，配置写在 `/usr/local/etc/xray/config.json`
 - 有 systemd 就装成服务 `xray`；容器里（无 systemd）用 `xray-xhttp-ctl start|status|logs|restart|stop`

@@ -47,6 +47,12 @@ EOF
 say() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[31m错误:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# 兼容 `bash -c "$(curl ...)" --port 8443` 这种写法：
+# bash 会把第一个参数当成 $0 吃掉（于是 --port 变成脚本名、8443 变成 $1），这里补回来。
+if [[ "$0" == -* ]]; then
+  set -- "$0" "$@"
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="${2:-}"; shift 2 ;;
