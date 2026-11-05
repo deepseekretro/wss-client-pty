@@ -70,6 +70,7 @@ SCROLLBACK_LIMIT = SCROLLBACK_KB * 1024
 # daemon -> client 的初始回放分块（避免一次性几 MB 的帧）
 REPLAY_CHUNK = 256 * 1024
 HANDSHAKE_TIMEOUT = 15      # WebSocket 握手超时（秒）
+VERSION = '1.4.0'            # 客户端版本（服务端列表里可看出谁还是旧脚本）
 DEFAULT_HEARTBEAT = 15      # 秒
 # daemon -> client 发送队列水位：超过后暂停读 pty（pty 满则 shell 阻塞，不丢数据）
 CLIENT_HIGH_WATER = 512 * 1024
@@ -196,6 +197,14 @@ class TtyDaemon:
             for fd in writable:
                 self._flush_client(fd)
 
+            # 兼容旧客户端（不发 FRAME_HELLO）：连上 0.5s 还没打招呼也回放
+            now_ts = time.time()
+            for pair in list(self.clients):
+                if pair[3] and now_ts - pair[3] > 0.5:
+                    pair[3] = 0
+                    self._queue_replay(pair)
+                    self._flush_client(pair[0])
+
             # master 读不到 & 子进程已退出 -> daemon 结束
             if not self._shell_alive():
                 self._log('shell 已退出，daemon 退出')
@@ -207,14 +216,10 @@ class TtyDaemon:
         except OSError:
             return
         conn.setblocking(False)
-        # 新 client 接入：先回放最近输出（保持断连/重启后屏幕不空）
-        # 按 REPLAY_CHUNK 分块入队，避免单帧过大
-        out = bytearray()
-        if self.scrollback:
-            data = bytes(self.scrollback)
-            for i in range(0, len(data), REPLAY_CHUNK):
-                out += self.encode_frame(FRAME_DATA, data[i:i + REPLAY_CHUNK])
-        self.clients.append([conn, b'', bytes(out)])
+        # 新 client 接入：先不回放，等它发 FRAME_HELLO 再补发。
+        # 这样 is_daemon_alive() 那种「连上就关」的探活不会让 daemon 白推几 MB。
+        # pair[3]：还没打招呼时的接入时间戳（0 表示已打过招呼），用于兼容旧客户端
+        self.clients.append([conn, b'', b'', time.time()])
         self._flush_client(conn)
 
     def _pump_master(self):
@@ -266,6 +271,17 @@ class TtyDaemon:
                 self._set_winsize(cols, rows)
             elif ftype == FRAME_HELLO:
                 self._log(f'client 接入: {payload.decode("utf-8", "replace")}')
+                pair[3] = 0
+                self._queue_replay(pair)
+
+
+    def _queue_replay(self, pair):
+        """把最近输出按 REPLAY_CHUNK 分块入队（避免单帧过大）"""
+        if not self.scrollback:
+            return
+        data = bytes(self.scrollback)
+        for i in range(0, len(data), REPLAY_CHUNK):
+            pair[2] += self.encode_frame(FRAME_DATA, data[i:i + REPLAY_CHUNK])
 
     def _flush_client(self, fd):
         """非阻塞发送：发出多少算多少，剩下的留在队列里，等 select 写就绪继续。"""
@@ -323,8 +339,9 @@ class TtyDaemon:
 class DaemonTty:
     """通过 unix socket 连接 daemon，读写远端 tty。"""
 
-    def __init__(self, sock_path):
+    def __init__(self, sock_path, name='client'):
         self.sock_path = sock_path
+        self.name = name
         self.sock = None
         self._buf = b''
 
@@ -335,6 +352,14 @@ class DaemonTty:
                 self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 self.sock.settimeout(5)
                 self.sock.connect(self.sock_path)
+                # 主动打招呼：daemon 收到后才回放历史（否则探活连接也会被灌几 MB）
+                hello = (self.name or 'client').encode('utf-8')[:64]
+                try:
+                    self.sock.sendall(
+                        struct.pack('>BI', FRAME_HELLO, len(hello)) + hello
+                    )
+                except OSError:
+                    pass
                 self.sock.setblocking(True)
                 return True
             except OSError as e:
@@ -724,6 +749,7 @@ class AgentLoop:
                     'name': self.name, 'host': self.host,
                     'os': self.os_name, 'arch': self.arch,
                     'heartbeat': self.heartbeat,
+                    'version': VERSION,
                     'scrollback_kb': max(16, self.scrollback_limit // 1024),
                     'token': self.token or None,
                 })
@@ -825,8 +851,11 @@ class AgentLoop:
                 if self.history:
                     # 分块上传历史（几 MB 一次发会撑爆单帧，也拖慢界面）
                     hist = bytes(self.history)
+                    # reset=True 让服务端用这份历史替换旧缓冲（否则每次重连都追加一遍）
                     for i in range(0, len(hist), REPLAY_CHUNK):
                         self.ws.send({'type': 'data',
+                                      'hist': True,
+                                      'reset': i == 0,
                                       'data': base64.b64encode(hist[i:i + REPLAY_CHUNK]).decode()})
                 self.pending = b''
             else:
@@ -1008,7 +1037,7 @@ def run_client(args):
         print('[remote-bash] 无法启动本地 daemon，退出', file=sys.stderr)
         return 2
 
-    tty_ = DaemonTty(daemon_path(name))
+    tty_ = DaemonTty(daemon_path(name), name=name)
     code = 0
     try:
         try:

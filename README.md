@@ -94,6 +94,17 @@ systemctl restart remote-bash-agent     # 重启
    - 改了 `--scrollback` 需要重建 daemon 才生效：`systemctl stop remote-bash-agent && pkill -f 'remote-bash-agent.py --daemon --name <名称>'`，再 `systemctl start remote-bash-agent`。
 6. **稳定客户端 id**：id 由 `名称 + 主机名` 哈希得出，重连后不变，浏览器面板可自动接回原客户端（不用重新点卡片）。
 
+## 两个入口的分工（安全相关）
+
+服务端有两个 WebSocket 入口，**角色是强制校验的**，走错入口会被 1008 关闭：
+
+| 入口 | 谁用 | 鉴权 |
+|---|---|---|
+| `wss://<host>/workbench/wss` | 远端客户端（agent） | nginx 免 Basic Auth；可选 `REMOTE_BASH_TOKEN`（agent 用 `--token`，服务端同名环境变量） |
+| `wss://<host>/workbench/viewer-ws` | 浏览器（viewer） | 由 nginx `auth_basic` 保护（同一站点已登录即可自动带上凭据），另可选 `REMOTE_BASH_VIEWER_TOKEN` |
+
+这样即使公网地址泄漏，也不能拿它当 viewer 直接接管别人的 tty。客户端列表里会显示每台 agent 的 `version`，据此可判断哪台还在跑旧脚本。
+
 ## 协议简述
 
 - **wss 端**（与 server `remote-bash.js` 一致）：JSON 文本帧。`hello(agent, name, host, os, arch, heartbeat, token?)` → 服务端回 `hello{ok, id, name}`；`data(base64)` 双向传 tty；`input`/`resize`/`ping`/`pong`；服务端在“同名重连替换旧连接”时发 `{type:'replaced'}`，被替换的 agent 主动退出（避免来回抢连接）。
