@@ -101,6 +101,19 @@ docker run -d --name rb-agent --restart=unless-stopped \
 - 没有 token 时首次运行会打印设备注册链接。`--docker` 模式会在前台先打印链接再转后台；
   `--foreground` 模式下链接打在容器日志里，`docker logs -f rb-agent | grep rb_pair` 看。
 
+## 附赠：一键装 Xray（VLESS + XHTTP + REALITY）
+
+不用域名、不用证书，装完直接打印 `vless://` 连接地址：
+
+```bash
+bash -c "$(curl -fsSL https://cdn.jsdelivr.net/gh/deepseekretro/wss-client-pty@main/install-xray-xhttp.sh)" --port 8443
+```
+
+- 自动生成 UUID / x25519 密钥 / shortId，配置写在 `/usr/local/etc/xray/config.json`
+- 有 systemd 就装成服务 `xray`；容器里（无 systemd）用 `xray-xhttp-ctl start|status|logs|restart|stop`
+- 最后打印连接地址和二维码（有 `qrencode` 时）
+- 容器里记得把端口发布出去：`docker run -p 8443:8443 ...`
+
 ## 完整参数
 
 | 参数 | 环境变量 | 默认 | 说明 |
