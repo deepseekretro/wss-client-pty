@@ -33,25 +33,73 @@ python3 remote-bash-agent.py --name mac-air --proxy http://127.0.0.1:3128
 
 然后浏览器打开 workbench → 顶部 **remote bash** → 左侧出现这台机器 → 点击即可控制其 tty。
 
-## 一键安装为 systemd 服务（失败自动重启）
+## 一键安装（systemd 机器 / docker 容器都能用）
+
+脚本会自己判断环境：**有运行中的 systemd 就装 systemd 服务，没有（容器/精简镜像）就自动切到容器模式**，
+也可以用 `--docker` / `--foreground` 显式指定。
 
 ```bash
-# 装成 systemd 服务，开机自启，进程崩溃/被杀 5 秒后自动拉起（client 重启会接回原 shell 会话）
+# 普通主机：装成 systemd 服务，开机自启，崩溃/被杀 5 秒后自动拉起（client 重启会接回原 shell 会话）
 curl -fsSL https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/install.sh | bash -s -- \
   --name win10 --url wss://edge02.10w123.com/workbench/wss --proxy http://127.0.0.1:3128
+
+# docker / 容器里常驻（无 systemd）：后台看护进程 + remote-bash-agent-ctl 管理
+curl -fsSL https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/install.sh | bash -s -- --name web01 --docker
+
+# 容器主进程（前台跑，日志直接进 docker logs，重启交给容器的 restart 策略）
+curl -fsSL https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/install.sh | bash -s -- --name web01 --foreground
 
 # 也可以全用环境变量
 REMOTE_BASH_NAME=win10 REMOTE_BASH_PROXY=http://127.0.0.1:3128 \
   curl -fsSL https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/install.sh | bash
 ```
 
-管理：
+### 有 systemd 的机器
 
 ```bash
 systemctl status  remote-bash-agent     # 状态
 journalctl -u remote-bash-agent -f      # 日志
-systemctl restart remote-bash-agent     # 重启
+systemctl restart remote-bash-agent     # 重启（只重启客户端，tty 里的任务不受影响）
 ```
+
+### docker / 容器（没有 systemd）
+
+`--docker` 会装一个看护脚本（客户端退出 5 秒后重启）和管理命令，不会去碰 systemd：
+
+```bash
+remote-bash-agent-ctl status    # 运行状态 + 最近日志
+remote-bash-agent-ctl logs      # tail -f /var/log/remote-bash-agent.log
+remote-bash-agent-ctl restart   # 只重启客户端，daemon/tty 不受影响
+remote-bash-agent-ctl stop      # 停客户端（daemon 保留，start 后接回同一会话）
+```
+
+`--foreground` 则直接在前台 `exec` 客户端，适合写进 Dockerfile 的 `CMD`：
+
+```dockerfile
+FROM python:3-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+ && curl -fsSL https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/install.sh \
+    | bash -s -- --name web01 --foreground
+```
+
+或者更省事，直接用一次性的容器跑安装 + 前台运行：
+
+```bash
+docker run -d --name rb-agent --restart=unless-stopped \
+  -e REMOTE_BASH_TOKEN=你的token \
+  -v rb-agent-state:/root/.remote-bash \
+  python:3-slim \
+  bash -c "apt-get update && apt-get install -y curl ca-certificates && \
+           curl -fsSL https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/install.sh | \
+           bash -s -- --name web01 --foreground"
+```
+
+容器里要注意两点：
+
+- `/etc/remote-bash-agent.env` 和 `~/.remote-bash/<名称>.token` 都在容器可写层里，**容器重建就丢**。
+  想保留登录态就挂卷（`-v rb-agent-state:/root/.remote-bash`），或者直接用 `-e REMOTE_BASH_TOKEN=xxx` 传 token。
+- 没有 token 时首次运行会打印设备注册链接。`--docker` 模式会在前台先打印链接再转后台；
+  `--foreground` 模式下链接打在容器日志里，`docker logs -f rb-agent | grep rb_pair` 看。
 
 ## 完整参数
 
@@ -64,13 +112,16 @@ systemctl restart remote-bash-agent     # 重启
 | `--heartbeat` | `REMOTE_BASH_HEARTBEAT` | 15 | 心跳间隔秒 |
 | `--scrollback` | `REMOTE_BASH_SCROLLBACK` | 4096 | 回放缓冲大小（KB）。daemon 保留最近这么多输出，断连重连后补发；4MB 约可回看几万行 |
 | `--shell` | `REMOTE_BASH_SHELL` | `$SHELL`/`/bin/bash` | 远端 shell（Windows 可 `--shell powershell`） |
+| `--docker` | `REMOTE_BASH_DEPLOY=docker` | 自动 | 容器模式：不装 systemd，用 `remote-bash-agent-ctl` 管理（客户端退出 5 秒后自动重启） |
+| `--foreground` | `REMOTE_BASH_DEPLOY=foreground` | 自动 | 前台运行，不做守护（适合作为容器主进程 / Dockerfile CMD） |
+| `--log` | `REMOTE_BASH_LOG` | `/var/log/remote-bash-agent.log` | 容器模式下的日志文件路径 |
 | `--daemon` | — | — | 只跑常驻 daemon（持有 tty） |
 | `--no-daemon` | — | — | 不自动拉起 daemon（连接已存在的） |
 
 ## 数据与状态
 
 - 会话状态目录：`~/.remote-bash/`（daemon 的 unix socket + 日志，环境变量 `REMOTE_BASH_STATE` 可改）
-- **daemon 是唯一持有 tty 的进程**。要彻底结束某个会话：`systemctl stop remote-bash-agent` 后还需杀掉对应 daemon：`pkill -f "remote-bash-agent.py --daemon --name <名称>"`（或删掉 `~/.remote-bash/<名称>.sock`）
+- **daemon 是唯一持有 tty 的进程**。要彻底结束某个会话：`systemctl stop remote-bash-agent`（容器里是 `remote-bash-agent-ctl stop`）后还需杀掉对应 daemon：`pkill -f "remote-bash-agent.py --daemon --name <名称>"`（或删掉 `~/.remote-bash/<名称>.sock`）
 
 ## 重启客户端不影响 tty（关键）
 
