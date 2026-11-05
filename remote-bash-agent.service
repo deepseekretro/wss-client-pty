@@ -4,6 +4,9 @@ Documentation=https://github.com/deepseekretro/wss-client-pty
 # 等网络就绪再启动；失败自动重启
 Wants=network-online.target
 After=network-online.target
+# systemd >= 229 起这两个键属于 [Unit]
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
@@ -14,8 +17,9 @@ ExecStart=/usr/bin/python3 /usr/local/bin/remote-bash-agent.py --name $REMOTE_BA
 # 失败即重启（崩溃 / 退出码非 0 / 被杀），重启前 5 秒
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=0
-StartLimitBurst=0
+# 重启/停止客户端时只杀主进程，不连带杀死 daemon（daemon 持有 tty/shell，
+# 里面可能跑着持久任务）。daemon 会被保留，下次启动自动接回同一会话。
+KillMode=process
 
 # 环境清理与安全
 NoNewPrivileges=true

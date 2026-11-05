@@ -71,6 +71,16 @@ systemctl restart remote-bash-agent     # 重启
 - 会话状态目录：`~/.remote-bash/`（daemon 的 unix socket + 日志，环境变量 `REMOTE_BASH_STATE` 可改）
 - **daemon 是唯一持有 tty 的进程**。要彻底结束某个会话：`systemctl stop remote-bash-agent` 后还需杀掉对应 daemon：`pkill -f "remote-bash-agent.py --daemon --name <名称>"`（或删掉 `~/.remote-bash/<名称>.sock`）
 
+## 重启客户端不影响 tty（关键）
+
+`systemctl restart remote-bash-agent` **只重启"客户端(桥)"进程，不会碰 daemon 和它持有的 shell**：
+
+- unit 里配置了 `KillMode=process`（否则 systemd 默认会把整个 cgroup 一起杀掉，daemon 和 tty 会跟着死）
+- 重启后新客户端连回同一个 daemon，屏幕内容由回放补齐，`vim` / `make` / `sleep` 之类正在跑的任务继续
+- 已实测：重启前后 daemon PID 不变，shell 里 `for i in $(seq 1 60); do echo TICK_$i; sleep 1; done` 在重启期间持续输出
+
+> 注意：**`systemctl stop` 同样不会杀死 tty**（这是故意的）。要彻底结束一个会话，需要 `systemctl stop remote-bash-agent` 之后手动杀掉对应 daemon（见下方"daemon 是唯一持有 tty 的进程"）。
+
 ## 会话恢复原理
 
 1. agent 启动时连接本地 daemon 的 unix socket（没有 daemon 就自动拉起）。
