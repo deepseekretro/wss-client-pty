@@ -55,6 +55,7 @@ except ImportError:
 RECONNECT_BASE = 2.0
 RECONNECT_MAX = 30.0
 BUFFER_LIMIT = 1024 * 1024  # 断线暂存上限 1MB
+SCROLLBACK_LIMIT = 256 * 1024  # 最近输出回放缓冲上限 256KB（daemon/client/server 一致）
 DEFAULT_HEARTBEAT = 15      # 秒
 
 # ---------- 本地 daemon 帧协议 ----------
@@ -78,6 +79,7 @@ class TtyDaemon:
         self.clients = []       # [(sock, read_buf)]
         self.server = None
         self._buf = b''
+        self.scrollback = b''   # 最近输出，用于新 client 连接时回放（保持屏幕内容）
 
     # ---- pty ----
     def _spawn_shell(self):
@@ -160,6 +162,13 @@ class TtyDaemon:
                         conn, _ = self.server.accept()
                     except OSError:
                         continue
+                    # 新 client 接入：先回放最近输出（保持断连/重启后屏幕不空）
+                    if self.scrollback:
+                        try:
+                            conn.settimeout(5)
+                            conn.sendall(self.encode_frame(FRAME_DATA, self.scrollback))
+                        except OSError:
+                            pass
                     conn.setblocking(False)
                     self.clients.append([conn, b''])
                     readers.append(conn)
@@ -171,6 +180,8 @@ class TtyDaemon:
                     except OSError:
                         data = None
                     if data:
+                        # 累积最近输出供回放（环形，上限 SCROLLBACK_LIMIT）
+                        self.scrollback = (self.scrollback + data)[-SCROLLBACK_LIMIT:]
                         frame = self.encode_frame(FRAME_DATA, data)
                         for pair in list(self.clients):
                             try:
@@ -257,11 +268,24 @@ class DaemonTty:
         self._buf = b''
 
     def open(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(5)
-        self.sock.connect(self.sock_path)
-        self.sock.setblocking(True)
-        return True
+        last_err = None
+        for _ in range(3):
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(5)
+                self.sock.connect(self.sock_path)
+                self.sock.setblocking(True)
+                return True
+            except OSError as e:
+                last_err = e
+                try:
+                    if self.sock:
+                        self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+                time.sleep(0.3)
+        raise last_err if last_err else OSError('连接 daemon 失败')
 
     def close(self):
         if self.sock:
@@ -586,6 +610,7 @@ class AgentLoop:
         self.heartbeat = heartbeat
         self.ws = None
         self.pending = b''
+        self.history = b''   # 最近 tty 输出，重连后先补发给服务端回放
         self.registered = False
         self.last_beat = 0.0
 
@@ -627,6 +652,7 @@ class AgentLoop:
             # 1. tty 输出
             out = self.tty.read()
             if out:
+                self.history = (self.history + out)[-SCROLLBACK_LIMIT:]
                 self.pending += out
                 if len(self.pending) > BUFFER_LIMIT:
                     self.pending = self.pending[-BUFFER_LIMIT:]
@@ -676,7 +702,11 @@ class AgentLoop:
                 self.registered = True
                 self.last_beat = time.time()
                 print(f'[remote-bash] 注册成功 id={m.get("id")} name={m.get("name")}')
-                self._flush()
+                # 先回放最近输出（让服务端/新 viewer 看到当前屏幕），再继续实时流。
+                # history 包含 pending 内容，所以回放后清空 pending 避免重复。
+                if self.history:
+                    self.ws.send({'type': 'data', 'data': base64.b64encode(self.history).decode()})
+                self.pending = b''
             else:
                 print(f'[remote-bash] 注册被拒: {m.get("error")}', file=sys.stderr)
                 raise SystemExit
@@ -743,18 +773,30 @@ def spawn_daemon(name, shell_cmd, proxy=''):
 
 
 def is_daemon_alive(name):
-    """尝试连接 unix socket 探测 daemon；能连上则 True"""
+    """探测本地 daemon。
+    True  = 活着（或不确定/忙，按活着处理，绝不重建以免丢掉旧 shell）
+    False = 确认没有 daemon 在 listen（socket 不存在或 ECONNREFUSED，可安全重建）
+    区分 ECONNREFUSED/ENOENT（陈旧 socket）与超时（可能只是忙）。"""
+    import errno
     path = daemon_path(name)
     if not os.path.exists(path):
         return False
-    try:
+    for _ in range(3):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(1)
-        s.connect(path)
-        s.close()
-        return True
-    except OSError:
-        return False
+        s.settimeout(1.5)
+        try:
+            s.connect(path)
+            return True
+        except OSError as e:
+            if e.errno in (errno.ECONNREFUSED, errno.ENOENT):
+                return False  # 确实无 daemon 在 listen
+            # 超时/其它：重试，仍不确定则按“活着”处理
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+    return True
 
 
 def ensure_daemon(name, shell_cmd, proxy='', max_wait=8):
@@ -829,8 +871,10 @@ def run_client(args):
 
     tty_ = DaemonTty(daemon_path(name))
     try:
-        if not tty_.open():
-            print('[remote-bash] 连接本地 daemon 失败', file=sys.stderr)
+        try:
+            tty_.open()
+        except OSError as e:
+            print(f'[remote-bash] 连接本地 daemon 失败: {e}', file=sys.stderr)
             return 2
         print(f'[remote-bash] 已连接本地 daemon: 会话 {name} (数据保存在 ~/.remote-bash)')
         if args.proxy:
