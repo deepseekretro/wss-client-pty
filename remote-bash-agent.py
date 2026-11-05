@@ -56,7 +56,20 @@ except ImportError:
 RECONNECT_BASE = 2.0
 RECONNECT_MAX = 30.0
 BUFFER_LIMIT = 1024 * 1024  # 断线暂存上限 1MB
-SCROLLBACK_LIMIT = 256 * 1024  # 最近输出回放缓冲上限 256KB（daemon/client/server 一致）
+# 最近输出回放缓冲默认大小（KB，可用 --scrollback / REMOTE_BASH_SCROLLBACK 调整）
+def _env_int(name, default):
+    try:
+        v = int(str(os.environ.get(name, '')).strip())
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+SCROLLBACK_KB = _env_int('REMOTE_BASH_SCROLLBACK', 4096)   # 默认 4MB
+SCROLLBACK_LIMIT = SCROLLBACK_KB * 1024
+# daemon -> client 的初始回放分块（避免一次性几 MB 的帧）
+REPLAY_CHUNK = 256 * 1024
+HANDSHAKE_TIMEOUT = 15      # WebSocket 握手超时（秒）
 DEFAULT_HEARTBEAT = 15      # 秒
 # daemon -> client 发送队列水位：超过后暂停读 pty（pty 满则 shell 阻塞，不丢数据）
 CLIENT_HIGH_WATER = 512 * 1024
@@ -75,7 +88,7 @@ FRAME_HELLO = 0x03  # client -> daemon: payload: 名称（UTF-8）
 class TtyDaemon:
     """持有 pty shell + 监听 unix socket；client 通过 socket 读写 tty。"""
 
-    def __init__(self, sock_path, shell_cmd, log_file=None):
+    def __init__(self, sock_path, shell_cmd, log_file=None, scrollback_limit=None):
         self.sock_path = sock_path
         self.shell_cmd = shell_cmd
         self.log_file = log_file
@@ -85,6 +98,7 @@ class TtyDaemon:
         self.server = None
         self._buf = b''
         self.scrollback = bytearray()   # 最近输出，用于新 client 连接时回放（保持屏幕内容）
+        self.scrollback_limit = scrollback_limit or SCROLLBACK_LIMIT
 
     # ---- pty ----
     def _spawn_shell(self):
@@ -194,8 +208,13 @@ class TtyDaemon:
             return
         conn.setblocking(False)
         # 新 client 接入：先回放最近输出（保持断连/重启后屏幕不空）
-        replay = self.encode_frame(FRAME_DATA, bytes(self.scrollback)) if self.scrollback else b''
-        self.clients.append([conn, b'', replay])
+        # 按 REPLAY_CHUNK 分块入队，避免单帧过大
+        out = bytearray()
+        if self.scrollback:
+            data = bytes(self.scrollback)
+            for i in range(0, len(data), REPLAY_CHUNK):
+                out += self.encode_frame(FRAME_DATA, data[i:i + REPLAY_CHUNK])
+        self.clients.append([conn, b'', bytes(out)])
         self._flush_client(conn)
 
     def _pump_master(self):
@@ -209,7 +228,7 @@ class TtyDaemon:
             return
         # 累积最近输出供回放（环形，上限 SCROLLBACK_LIMIT）
         self.scrollback += data
-        over = len(self.scrollback) - SCROLLBACK_LIMIT
+        over = len(self.scrollback) - self.scrollback_limit
         if over > 0:
             del self.scrollback[:over]
         frame = self.encode_frame(FRAME_DATA, data)
@@ -478,12 +497,14 @@ class WsClient:
         # --- 手写实现 ---
         import ssl
         sock = self._open_tcp(host, port)
+        # 握手阶段必须有超时：服务端不回包时不至于永久卡死（会在外层退避重试）
+        sock.settimeout(HANDSHAKE_TIMEOUT)
         if u.scheme == 'wss':
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE  # 自签证书也接受
             sock = ctx.wrap_socket(sock, server_hostname=host)
-        sock.settimeout(None)
+            sock.settimeout(HANDSHAKE_TIMEOUT)
 
         key = base64.b64encode(os.urandom(16)).decode()
         req = (
@@ -512,6 +533,8 @@ class WsClient:
             raise ConnectionError(f'WebSocket 握手失败: {status}')
         self._read_buf = rest
         self.raw = sock
+        # 握手完成：之后的读写超时由 recv_text 自己控制
+        self.raw.settimeout(None)
 
     # ---- 发送 ----------------
     def send_text(self, text):
@@ -652,7 +675,8 @@ class WsClient:
 # 事件循环：tty(daemon) <-> wss 双向 + 心跳
 # --------------------------------------------------------------------------
 class AgentLoop:
-    def __init__(self, tty_, url, token, proxy, name, host, os_name, arch, heartbeat, shell=''):
+    def __init__(self, tty_, url, token, proxy, name, host, os_name, arch, heartbeat, shell='',
+                 scrollback_limit=None):
         self.tty = tty_
         self.url = url
         self.token = token
@@ -666,6 +690,7 @@ class AgentLoop:
         self.ws = None
         self.pending = b''
         self.history = bytearray()   # 最近 tty 输出，重连后先补发给服务端回放
+        self.scrollback_limit = scrollback_limit or SCROLLBACK_LIMIT
         self.registered = False
         self.ok_count = 0            # 注册成功次数（用于判断是否真的连上 past）
         self.last_beat = 0.0
@@ -678,7 +703,8 @@ class AgentLoop:
             if not self.tty.is_alive():
                 try:
                     self.tty.close()
-                    if not ensure_daemon(self.name, self.shell, self.proxy):
+                    if not ensure_daemon(self.name, self.shell, self.proxy,
+                                         scrollback_kb=max(16, self.scrollback_limit // 1024)):
                         raise OSError('ensure_daemon 失败')
                     self.tty.open()
                     print('[remote-bash] 本地 daemon 已重建，会话恢复')
@@ -698,6 +724,7 @@ class AgentLoop:
                     'name': self.name, 'host': self.host,
                     'os': self.os_name, 'arch': self.arch,
                     'heartbeat': self.heartbeat,
+                    'scrollback_kb': max(16, self.scrollback_limit // 1024),
                     'token': self.token or None,
                 })
                 self.last_beat = time.time()
@@ -738,7 +765,7 @@ class AgentLoop:
                     break
                 got_data = True
                 self.history += out
-                over = len(self.history) - SCROLLBACK_LIMIT
+                over = len(self.history) - self.scrollback_limit
                 if over > 0:
                     del self.history[:over]
                 self.pending += out
@@ -796,7 +823,11 @@ class AgentLoop:
                 # 先回放最近输出（让服务端/新 viewer 看到当前屏幕），再继续实时流。
                 # history 包含 pending 内容，所以回放后清空 pending 避免重复。
                 if self.history:
-                    self.ws.send({'type': 'data', 'data': base64.b64encode(bytes(self.history)).decode()})
+                    # 分块上传历史（几 MB 一次发会撑爆单帧，也拖慢界面）
+                    hist = bytes(self.history)
+                    for i in range(0, len(hist), REPLAY_CHUNK):
+                        self.ws.send({'type': 'data',
+                                      'data': base64.b64encode(hist[i:i + REPLAY_CHUNK]).decode()})
                 self.pending = b''
             else:
                 print(f'[remote-bash] 注册被拒: {m.get("error")}', file=sys.stderr)
@@ -854,13 +885,14 @@ def daemon_log(name):
     return os.path.join(state_dir(), f'{safe}.daemon.log')
 
 
-def spawn_daemon(name, shell_cmd, proxy=''):
+def spawn_daemon(name, shell_cmd, proxy='', scrollback_kb=None):
     """后台拉起 daemon 进程（与当前进程脱离），返回是否成功。
     proxy: HTTP 代理（如 http://127.0.0.1:3128），传给 daemon 注入其 shell 环境。"""
     try:
         proc = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), '--daemon', '--name', name,
-             '--shell', shell_cmd or '', '--proxy', proxy or ''],
+             '--shell', shell_cmd or '', '--proxy', proxy or '',
+             '--scrollback', str(scrollback_kb or (SCROLLBACK_LIMIT // 1024))],
             stdin=subprocess.DEVNULL,
             stdout=open(daemon_log(name), 'a'),
             stderr=subprocess.STDOUT,
@@ -900,7 +932,7 @@ def is_daemon_alive(name):
     return True
 
 
-def ensure_daemon(name, shell_cmd, proxy='', max_wait=8):
+def ensure_daemon(name, shell_cmd, proxy='', max_wait=8, scrollback_kb=None):
     """保证 daemon 就绪：活着则直接返回；否则拉起并等待 socket。"""
     if is_daemon_alive(name):
         return True
@@ -911,7 +943,7 @@ def ensure_daemon(name, shell_cmd, proxy='', max_wait=8):
             os.unlink(path)
     except OSError:
         pass
-    if not spawn_daemon(name, shell_cmd, proxy):
+    if not spawn_daemon(name, shell_cmd, proxy, scrollback_kb):
         return False
     deadline = time.time() + max_wait
     while time.time() < deadline:
@@ -946,10 +978,12 @@ def run_daemon(args):
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     # 启动 shell 前先注入代理环境变量（--proxy 默认读 REMOTE_BASH_PROXY）
     inject_proxy_env(args.proxy)
+    limit = max(16, int(getattr(args, 'scrollback', 0) or SCROLLBACK_KB)) * 1024
     d = TtyDaemon(daemon_path(args.name),
                   args.shell or os.environ.get('REMOTE_BASH_SHELL')
                   or (os.environ.get('SHELL') or '/bin/bash'),
-                  log_file=daemon_log(args.name))
+                  log_file=daemon_log(args.name),
+                  scrollback_limit=limit)
     try:
         d.run()
     except KeyboardInterrupt:
@@ -968,8 +1002,9 @@ def run_client(args):
     os_name = platform.system() or 'unknown'
     arch = platform.machine() or 'unknown'
     shell_cmd = args.shell or os.environ.get('REMOTE_BASH_SHELL') or ''
+    sb_kb = max(16, int(getattr(args, 'scrollback', 0) or SCROLLBACK_KB))
 
-    if not ensure_daemon(name, shell_cmd, args.proxy):
+    if not ensure_daemon(name, shell_cmd, args.proxy, scrollback_kb=sb_kb):
         print('[remote-bash] 无法启动本地 daemon，退出', file=sys.stderr)
         return 2
 
@@ -988,7 +1023,7 @@ def run_client(args):
 
         loop = AgentLoop(tty_, args.url, args.token, args.proxy, name,
                          socket.gethostname() or '', os_name, arch, args.heartbeat,
-                         shell=shell_cmd)
+                         shell=shell_cmd, scrollback_limit=sb_kb * 1024)
         code = loop.run()
     finally:
         tty_.close()
@@ -1006,6 +1041,8 @@ def main():
     ap.add_argument('--shell', default='', help='远端 shell 命令（默认 $SHELL 或 /bin/bash）')
     ap.add_argument('--proxy', default=os.environ.get('REMOTE_BASH_PROXY', os.environ.get('http_proxy', os.environ.get('HTTP_PROXY', ''))),
                     help='通过 HTTP 代理连接（如 http://127.0.0.1:3128；默认环境变量）')
+    ap.add_argument('--scrollback', type=int, default=SCROLLBACK_KB,
+                    help='断连重连后回放的最近输出大小（KB，默认 4096=4MB）')
     ap.add_argument('--heartbeat', type=int, default=DEFAULT_HEARTBEAT,
                     help=f'心跳间隔秒数（默认 {DEFAULT_HEARTBEAT}s，保持长连接）')
     ap.add_argument('--no-daemon', action='store_true',

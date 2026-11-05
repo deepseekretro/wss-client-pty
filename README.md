@@ -62,6 +62,7 @@ systemctl restart remote-bash-agent     # 重启
 | `--token` | `REMOTE_BASH_TOKEN` | 空 | 可选鉴权口令（服务端必须相同） |
 | `--proxy` | `REMOTE_BASH_PROXY` / `http_proxy` | 空 | HTTP 代理（CONNECT 隧道）；同时注入持久 shell 环境（`http_proxy`/`https_proxy`/`NO_PROXY`），shell 内 git/curl/pip 自动走代理 |
 | `--heartbeat` | `REMOTE_BASH_HEARTBEAT` | 15 | 心跳间隔秒 |
+| `--scrollback` | `REMOTE_BASH_SCROLLBACK` | 4096 | 回放缓冲大小（KB）。daemon 保留最近这么多输出，断连重连后补发；4MB 约可回看几万行 |
 | `--shell` | `REMOTE_BASH_SHELL` | `$SHELL`/`/bin/bash` | 远端 shell（Windows 可 `--shell powershell`） |
 | `--daemon` | — | — | 只跑常驻 daemon（持有 tty） |
 | `--no-daemon` | — | — | 不自动拉起 daemon（连接已存在的） |
@@ -87,7 +88,10 @@ systemctl restart remote-bash-agent     # 重启
 2. daemon 里 `pty.fork()` 出来的 shell 进程与 agent 完全独立。
 3. agent 崩溃 / 系统重启 agent 服务 → shell 不受影响（daemon 仍在）。
 4. agent 再次启动 → 重新连回同一 daemon → 接回 shell 会话，继续输入输出。
-5. **屏幕内容回放**：daemon 保留最近 256KB 输出，新 agent 连上来先补发；agent 注册成功后会把历史发给服务端；服务端为新 attach 的 viewer 回放。所以断连重连、甚至 agent 进程重启后，浏览器打开 remote bash 仍能看到断线前的屏幕，不会只剩“已连接”。
+5. **屏幕内容回放**：daemon 保留最近 `--scrollback`（默认 4MB）输出，新 agent 连上来按 256KB 分块补发；agent 注册成功后同样分块把历史发给服务端；服务端为新 attach 的 viewer 分块回放。所以断连重连、甚至 agent 进程重启后，浏览器打开 remote bash 仍能看到断线前的屏幕（几万行），不会只剩“已连接”。
+   - 想回看更多：客户端加 `--scrollback 8192`（8MB）或设 `REMOTE_BASH_SCROLLBACK`；服务端可用 `REMOTE_BASH_SCROLLBACK`（默认 4096KB）和 `REMOTE_BASH_MAX_SCROLLBACK`（默认 32768KB，即客户端最多能申请到 32MB）限制上限。
+   - 浏览器端 xterm 默认保留 5 万行滚动历史，可用 `localStorage.rb_scrollback = 200000` 调整。
+   - 改了 `--scrollback` 需要重建 daemon 才生效：`systemctl stop remote-bash-agent && pkill -f 'remote-bash-agent.py --daemon --name <名称>'`，再 `systemctl start remote-bash-agent`。
 6. **稳定客户端 id**：id 由 `名称 + 主机名` 哈希得出，重连后不变，浏览器面板可自动接回原客户端（不用重新点卡片）。
 
 ## 协议简述
