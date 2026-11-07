@@ -47,6 +47,12 @@ irm https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/windows-
 
 如需 frp SSH 隧道，另见 `frpc-msys2-setup.sh`（MSYS2 openssh 版）。
 
+已装好 MSYS2 的话，不用 PowerShell 那条，直接在 **MSYS2 bash** 里跑这一份（只装 python3 + remote-bash）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/msys2-remote-bash-setup.sh | bash -s -- --name win-pc
+```
+
 ## 一键安装（systemd 机器 / docker 容器都能用）
 
 脚本会自己判断环境：**有运行中的 systemd 就装 systemd 服务，没有（容器/精简镜像）就自动切到容器模式**，
