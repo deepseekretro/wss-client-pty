@@ -67,7 +67,9 @@ else
 fi
 
 echo "[2/5] 安装 MSYS2 openssh ..."
-if [ ! -x /usr/sbin/sshd ] && ! command -v sshd >/dev/null 2>&1; then
+SSHD_BIN=""; for CAND in /usr/bin/sshd /usr/bin/sshd.exe /usr/sbin/sshd; do [ -x "$CAND" ] && { SSHD_BIN="$CAND"; break; }; done
+[ -z "$SSHD_BIN" ] && command -v sshd >/dev/null 2>&1 && SSHD_BIN=$(command -v sshd)
+if [ -z "$SSHD_BIN" ]; then
   pacman -Sy --noconfirm --needed openssh || { echo "!! openssh 安装失败"; exit 1; }
 fi
 mkdir -p /run/sshd /var/empty
@@ -90,7 +92,7 @@ if [ -n "$SSD_WIN" ]; then
   net start sshd >/dev/null 2>&1 || echo "[!] net start sshd 未成功（非管理员？），改用进程兜底"
 fi
 if ! pgrep -x sshd >/dev/null 2>&1; then
-  /usr/sbin/sshd >>/opt/frp/sshd.log 2>&1 || true
+  "$SSHD_BIN" >>/opt/frp/sshd.log 2>&1 || true
   sleep 1
 fi
 pgrep -x sshd >/dev/null 2>&1 && echo "sshd 已运行" || { echo "!! sshd 未运行，请看 /opt/frp/sshd.log"; tail -6 /opt/frp/sshd.log 2>/dev/null || true; }
