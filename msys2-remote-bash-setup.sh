@@ -2,8 +2,7 @@
 # msys2-remote-bash-setup.sh — 在 MSYS2 bash 里运行：装 python3 + 提供 remote-bash
 #
 # 前提：MSYS2 已装好（本脚本不装 MSYS2；要装 MSYS2 用 windows-msys2-remote-bash.ps1）。
-# 做什么：pacman 装 python3 -> 下载本仓库的 remote-bash-agent.py -> 启动 agent（tty = MSYS2 bash）
-#         -> 尽量注册 Windows 计划任务实现登录自启（需要管理员，失败则只做本次后台启动）。
+# 做什么：pacman 装 python3 -> 下载本仓库的 remote-bash-agent.py -> 在 tmux 会话 remote-bash 里启动 agent（tty = MSYS2 bash，关窗口不死）。
 #
 # 用法（MSYS2 bash 里，一行）：
 #   curl -fsSL https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/msys2-remote-bash-setup.sh | bash -s -- --name win-pc
@@ -70,24 +69,27 @@ exec python3 ~/remote-bash-agent.py --url '$URL' --name '$NAME'
 EOF
 chmod +x ~/remote-bash-run.sh
 
-# 尽量注册登录自启（需要管理员；schatasks 在 MSYS2 里叫 schtasks.exe）
-echo "[4/4] 注册自启 + 启动 ..."
-RUN_WIN=$(cygpath -w ~/remote-bash-run.sh 2>/dev/null || echo "")
-BASH_WIN=$(cygpath -w /usr/bin/bash.exe 2>/dev/null || cygpath -w /usr/bin/bash 2>/dev/null || echo "")
-if command -v schtasks.exe >/dev/null 2>&1 && [ -n "$BASH_WIN" ]; then
-  schtasks.exe /Create /TN RemoteBashAgent /SC LOGON /RL HIGHEST \
-    /TR "\"$BASH_WIN\" -lc /home/remote-bash-run.sh" /F >/dev/null 2>&1 \
-    && echo "计划任务 RemoteBashAgent 已注册（登录自启）" \
-    || echo "[!] 计划任务注册失败（非管理员？），只做本次后台启动"
+# tmux 常驻（关掉当前 MSYS2 窗口会话不死；attach 看日志）
+if [ "$FOREGROUND" = "0" ]; then
+echo "[4/4] tmux 启动 agent ..."
+if ! command -v tmux >/dev/null 2>&1; then
+  pacman -Sy --noconfirm --needed tmux 2>/dev/null || echo "[!] tmux 未装，将用 setsid 兜底"
+fi
+mkdir -p ~/.remote-bash
+if command -v tmux >/dev/null 2>&1; then
+  tmux kill-session -t remote-bash 2>/dev/null || true
+  tmux new-session -d -s remote-bash "bash ~/remote-bash-run.sh"
+  sleep 1
+  tmux has-session -t remote-bash 2>/dev/null && echo "agent 已在 tmux 会话 remote-bash 里运行（tmux attach -t remote-bash 看日志，Ctrl+b d 脱离）" || echo "[!] tmux 会话未存活，请 tmux attach -t remote-bash 排查"
+else
+  setsid nohup bash ~/remote-bash-run.sh >> ~/.remote-bash/msys2-agent.log 2>&1 </dev/null &
+  sleep 2
+  pgrep -f remote-bash-agent.py >/dev/null 2>&1 && echo "agent 已在后台运行" || echo "[!] agent 未存活，请看 ~/.remote-bash/msys2-agent.log"
+fi
+echo "去 workbench 的 Remote Bash 看设备 [$NAME]"
 fi
 
 if [ "$FOREGROUND" = "1" ]; then
   echo "前台运行（Ctrl+C 停 client，daemon 里的 shell 不死）..."
   exec bash ~/remote-bash-run.sh
-else
-  mkdir -p ~/.remote-bash
-  setsid nohup bash ~/remote-bash-run.sh >> ~/.remote-bash/msys2-agent.log 2>&1 </dev/null &
-  sleep 2
-  pgrep -f remote-bash-agent.py >/dev/null 2>&1 && echo "agent 已在后台运行" || echo "[!] agent 未存活，请看 ~/.remote-bash/msys2-agent.log"
-  echo "去 workbench 的 Remote Bash 看设备 [$NAME]；日志：~/.remote-bash/msys2-agent.log"
 fi
