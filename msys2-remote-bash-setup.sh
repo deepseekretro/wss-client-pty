@@ -45,7 +45,12 @@ fi
 python3 --version
 python3 -c "import pty; print('pty OK')"
 # websocket-client 可选：agent 有标准库兜底，装不上不拦
-pacman -Sy --noconfirm --needed python-websocket-client 2>/dev/null || echo "[!] websocket-client 未装（标准库兜底，可跑）"
+WS_OK=0
+for PKG in python-websocket-client mingw-w64-x86_64-python-websocket-client mingw-w64-ucrt-x86_64-python-websocket-client; do
+  if pacman -Sy --noconfirm --needed "$PKG" >/dev/null 2>&1; then WS_OK=1; break; fi
+done
+[ "$WS_OK" = "1" ] || python3 -m pip install --user -q websocket-client >/dev/null 2>&1 && WS_OK=1 || true
+[ "$WS_OK" = "1" ] && echo "websocket-client OK" || echo "[!] websocket-client 未装（标准库兜底，可跑）"
 
 echo "[2/4] 部署 remote-bash-agent.py ..."
 if [ ! -f ~/remote-bash-agent.py ] || [ "${REMOTE_BASH_UPDATE_AGENT:-1}" = "1" ]; then
@@ -80,6 +85,7 @@ if [ "$FOREGROUND" = "1" ]; then
   echo "前台运行（Ctrl+C 停 client，daemon 里的 shell 不死）..."
   exec bash ~/remote-bash-run.sh
 else
+  mkdir -p ~/.remote-bash
   setsid nohup bash ~/remote-bash-run.sh >> ~/.remote-bash/msys2-agent.log 2>&1 </dev/null &
   sleep 2
   pgrep -f remote-bash-agent.py >/dev/null 2>&1 && echo "agent 已在后台运行" || echo "[!] agent 未存活，请看 ~/.remote-bash/msys2-agent.log"

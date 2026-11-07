@@ -73,7 +73,7 @@ Write-Host "[2/4] pacman 安装 python3 ..."
 Run-MsysBash 'pacman -Sy --noconfirm --needed python3'
 Run-MsysBash 'python3 --version && python3 -c "import pty; print(\"pty OK\")"'
 # 可选：websocket-client 不装也能跑（agent 有标准库兜底），装上更稳
-Run-MsysBash 'pacman -Sy --noconfirm --needed python-websocket-client || true'
+Run-MsysBash 'for P in python-websocket-client mingw-w64-x86_64-python-websocket-client mingw-w64-ucrt-x86_64-python-websocket-client; do pacman -Sy --noconfirm --needed $P && break; done; python3 -m pip install --user -q websocket-client || true'
 
 # --- 3. 把 agent 拷进 MSYS2 ---
 Write-Host "[3/4] 部署 remote-bash-agent.py ..."
