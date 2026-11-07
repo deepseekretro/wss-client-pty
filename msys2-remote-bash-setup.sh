@@ -74,7 +74,7 @@ export REMOTE_BASH_NAME='$NAME'
 export REMOTE_BASH_TOKEN='$TOKEN'
 export REMOTE_BASH_PROXY='$PROXY'
 export REMOTE_BASH_SHELL='/usr/bin/bash'
-exec /usr/bin/python3 ~/remote-bash-agent.py --url '$URL' --name '$NAME'
+exec /usr/bin/python3 ~/remote-bash-agent.py --url '$URL' --name '$NAME' --proxy '$PROXY'
 EOF
 chmod +x ~/remote-bash-run.sh
 
