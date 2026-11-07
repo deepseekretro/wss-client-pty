@@ -11,28 +11,38 @@
 #   作为容器主进程（前台运行，日志直接进 docker logs）：
 #     ... | bash -s -- --name web01 --foreground
 #
-# 行为：
-#   1. 下载 remote-bash-agent.py 到 /usr/local/bin/
-#   2. 按参数生成 /etc/remote-bash-agent.env（名称/地址/token/代理/心跳）
-#   3. 按部署模式启动：
-#        systemd    → 安装 remote-bash-agent.service（失败重启、开机自启）
+# 行为（可重入：重复执行 = 原地升级）：
+#   1. 下载 remote-bash-agent.py 到 /usr/local/bin/（先落临时文件、校验通过后再替换，
+#      下载失败不会把已装好的脚本写坏）
+#   2. 按参数生成 /etc/remote-bash-agent.env（名称/地址/token/代理/心跳）。
+#      **没显式给的参数会沿用上一次写入的值**，重跑不加参数不会把名称/token/代理清掉；
+#      优先级：命令行 > 环境变量 > 已有 env 文件 > 默认值（地址/心跳/主机名）
+#   3. 停掉旧客户端，并**重启 daemon**：pty 写入修复等关键代码在 daemon 进程里，
+#      只重启客户端的话旧 daemon 还在跑旧代码，升级不生效（--keep-daemon 可保留 tty 会话，
+#      但 daemon 里的代码也不会跟着升级，谨慎使用）
+#   4. 按部署模式启动：
+#        systemd    → 安装 remote-bash-agent.service（失败重启、开机自启），用 restart
+#                     确保已在跑的服务也换成新代码（enable --now 对已激活的服务是空操作）
 #        docker     → 装一个 5 秒重启的看护进程 + remote-bash-agent-ctl 管理脚本
 #        foreground → 直接在前台 exec（当成容器主进程）
-#   4. 没有 token 时先在前台跑设备注册，打印浏览器链接
+#   5. 没有 token 时先在前台跑设备注册，打印浏览器链接；已有 token 文件则跳过
 set -euo pipefail
 
 NAME="${REMOTE_BASH_NAME:-}"
-URL="${REMOTE_BASH_URL:-wss://edge02.10w123.com/workbench/wss}"
+URL="${REMOTE_BASH_URL:-}"
 TOKEN="${REMOTE_BASH_TOKEN:-}"
 PROXY="${REMOTE_BASH_PROXY:-}"
-HEARTBEAT="${REMOTE_BASH_HEARTBEAT:-15}"
+HEARTBEAT="${REMOTE_BASH_HEARTBEAT:-}"
 SHELL_CMD="${REMOTE_BASH_SHELL:-}"
 DEPLOY="${REMOTE_BASH_DEPLOY:-}"          # systemd | docker | foreground
 LOGFILE="${REMOTE_BASH_LOG:-/var/log/remote-bash-agent.log}"
+KEEP_DAEMON="${REMOTE_BASH_KEEP_DAEMON:-0}"
 
 BIN=/usr/local/bin/remote-bash-agent.py
+BIN_NEW="$BIN.new"
 ENVFILE=/etc/remote-bash-agent.env
 UNIT=remote-bash-agent.service
+UNIT_PATH="/etc/systemd/system/$UNIT"
 RUNNER=/usr/local/bin/remote-bash-agent-run.sh
 CTL=/usr/local/bin/remote-bash-agent-ctl
 PIDFILE="${REMOTE_BASH_PIDFILE:-/run/remote-bash-agent.pid}"
@@ -45,28 +55,41 @@ SOURCES=(
 )
 
 fetch() {
-  # $1 = 仓库内相对路径, $2 = 本地输出
-  local rel="$1" out="$2" src
+  # $1 = 仓库内相对路径, $2 = 本地输出；先落临时文件，成功才原子替换，避免下载失败写坏已有文件
+  local rel="$1" out="$2" src tmp
+  tmp="${out}.tmp.$$"
   for src in "${SOURCES[@]}"; do
-    if curl -fsSL "$src/$rel" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+    if curl -fsSL "$src/$rel" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+      mv -f "$tmp" "$out"
       return 0
     fi
   done
+  rm -f "$tmp"
   return 1
+}
+
+# agent 按名字把 daemon socket/token 放在 ~/.remote-bash/ 下，名字里的非法字符会被替换
+safe_name() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
 }
 
 usage() {
   echo "用法:"
   echo "  $0 [--name 名称] [--url wss://...] [--token xxx] [--proxy http://127.0.0.1:3128]"
   echo "     [--heartbeat 15] [--shell /bin/bash] [--docker | --foreground] [--log /var/log/xxx.log]"
+  echo "     [--keep-daemon]   # 重装时保留现有 daemon/tty 会话（daemon 里的代码不会升级）"
   echo
   echo "部署模式（自动判断，也可显式指定）:"
   echo "  默认     有 systemd 就用 systemd，没有就自动退化成 docker 模式"
   echo "  --docker 不装 systemd：后台看护进程 + remote-bash-agent-ctl 管理（适合容器里常驻）"
   echo "  --foreground 直接前台运行，不做守护（适合作为容器主进程/Dockerfile CMD）"
   echo
+  echo "可重入：重复执行本脚本 = 原地升级。没给的参数沿用 /etc/remote-bash-agent.env 里的旧值，"
+  echo "已有 token 文件时跳过设备注册；升级会重启客户端和 daemon（tty 会话重建）。"
+  echo
   echo "也可用环境变量: REMOTE_BASH_NAME / REMOTE_BASH_URL / REMOTE_BASH_TOKEN / REMOTE_BASH_PROXY"
   echo "                REMOTE_BASH_HEARTBEAT / REMOTE_BASH_SHELL / REMOTE_BASH_DEPLOY / REMOTE_BASH_LOG"
+  echo "                REMOTE_BASH_KEEP_DAEMON=1（同 --keep-daemon）"
   echo
   echo "docker 例子:"
   echo "  curl -fsSL .../install.sh | bash -s -- --name web01 --docker"
@@ -83,6 +106,7 @@ while [[ $# -gt 0 ]]; do
     --shell) SHELL_CMD="${2:-}"; shift 2 ;;
     --docker|--no-systemd|--container) DEPLOY=docker; shift ;;
     --foreground|--fg) DEPLOY=foreground; shift ;;
+    --keep-daemon) KEEP_DAEMON=1; shift ;;
     --log) LOGFILE="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数: $1"; usage; exit 1 ;;
@@ -103,6 +127,30 @@ if ! command -v curl >/dev/null; then
   echo "需要 curl（镜像里请先 apt-get install -y curl 或 apk add curl）" >&2
   exit 1
 fi
+
+# ---------------------------------------------------------------- 沿用已有安装的配置（可重入的关键）
+# 优先级：命令行/环境变量（上面已填）> 已有 env 文件 > 默认值。
+# 这样升级时不加参数重跑，不会把上次的名称/地址/token/代理清掉。
+load_existing_env() {
+  [[ -r "$ENVFILE" ]] || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      REMOTE_BASH_NAME) [[ -z "$NAME" ]] && NAME="$v" ;;
+      REMOTE_BASH_URL) [[ -z "$URL" ]] && URL="$v" ;;
+      REMOTE_BASH_TOKEN) [[ -z "$TOKEN" ]] && TOKEN="$v" ;;
+      REMOTE_BASH_PROXY) [[ -z "$PROXY" ]] && PROXY="$v" ;;
+      REMOTE_BASH_HEARTBEAT) [[ -z "$HEARTBEAT" ]] && HEARTBEAT="$v" ;;
+      REMOTE_BASH_SHELL) [[ -z "$SHELL_CMD" ]] && SHELL_CMD="$v" ;;
+    esac
+  done < "$ENVFILE"
+}
+load_existing_env
+
+URL="${URL:-wss://edge02.10w123.com/workbench/wss}"
+HEARTBEAT="${HEARTBEAT:-15}"
+NAME="${NAME:-$(hostname)}"
+SAFE_NAME="$(safe_name "$NAME")"
 
 # ---------------------------------------------------------------- 部署模式判断
 SYSTEMD_READY=0
@@ -125,32 +173,51 @@ if [[ "$DEPLOY" == "systemd" && $SYSTEMD_READY -ne 1 ]]; then
   exit 1
 fi
 
-# ---------------------------------------------------------------- 下载 & 配置
+# ---------------------------------------------------------------- 下载 & 校验（失败就地退出，老安装不动）
 echo "==> 下载 remote-bash-agent.py"
-fetch remote-bash-agent.py "$BIN" || { echo "下载脚本失败（所有源均不可用）" >&2; exit 1; }
-chmod +x "$BIN"
-python3 -m py_compile "$BIN"
+fetch remote-bash-agent.py "$BIN_NEW" || { echo "下载脚本失败（所有源均不可用），已有安装未改动" >&2; exit 1; }
+python3 -m py_compile "$BIN_NEW" || { echo "下载到的脚本校验失败，已有安装未改动" >&2; rm -f "$BIN_NEW"; exit 1; }
+AGENT_VERSION="$(sed -n "s/^VERSION = '\([^']*\)'.*/\1/p" "$BIN_NEW" | tail -1)"
+echo "    agent 版本: ${AGENT_VERSION:-?}（面板里显示的即此版本）"
 
-echo "==> 写环境配置 $ENVFILE"
-cat > "$ENVFILE" <<EOF
-REMOTE_BASH_NAME=${NAME}
-REMOTE_BASH_URL=${URL}
-REMOTE_BASH_TOKEN=${TOKEN}
-REMOTE_BASH_PROXY=${PROXY}
-REMOTE_BASH_HEARTBEAT=${HEARTBEAT}
-REMOTE_BASH_SHELL=${SHELL_CMD}
-EOF
-chmod 600 "$ENVFILE"
+if [[ "$DEPLOY" == "systemd" ]]; then
+  fetch remote-bash-agent.service "${UNIT_PATH}.new" || { echo "下载 unit 失败，已有安装未改动" >&2; rm -f "$BIN_NEW"; exit 1; }
+fi
 
-# 组装客户端参数（数组，避免名称/代理里带空格时被拆开）
-DEPLOY_ARGS=(--url "$URL" --heartbeat "$HEARTBEAT")
-if [[ -n "$NAME" ]]; then DEPLOY_ARGS+=(--name "$NAME"); fi
-if [[ -n "$PROXY" ]]; then DEPLOY_ARGS+=(--proxy "$PROXY"); fi
-if [[ -n "$SHELL_CMD" ]]; then DEPLOY_ARGS+=(--shell "$SHELL_CMD"); fi
+# ---------------------------------------------------------------- 停旧客户端 + 重启 daemon
+stop_existing_client() {
+  if [[ "$DEPLOY" == "systemd" ]]; then
+    systemctl stop "$UNIT" >/dev/null 2>&1 || true
+  elif [[ "$DEPLOY" == "docker" && -x "$CTL" ]]; then
+    "$CTL" stop >/dev/null 2>&1 || true
+  fi
+  pkill -f "remote-bash-agent-run.sh" 2>/dev/null || true
+}
+
+# 只按会话名杀本机的 agent 进程（客户端 + daemon），不碰其他名字/其他机器。
+# 必须杀 daemon：关键修复（pty 写入）在 daemon 进程里，只换客户端代码不生效。
+kill_agent_for_name() {
+  local pat="remote-bash-agent\.py.*--name ${SAFE_NAME}([[:space:]]|$)"
+  pkill -f "$pat" 2>/dev/null || true
+  sleep 1
+  pkill -9 -f "$pat" 2>/dev/null || true
+  if [[ "$KEEP_DAEMON" == "1" ]]; then
+    echo "    --keep-daemon：保留现有 daemon/tty（daemon 仍是旧代码，pty 修复要等 daemon 重启后才生效）"
+  else
+    # daemon 被杀后 socket 文件会残留，顺手清掉（ensure_daemon 本来也会处理）
+    rm -f "${HOME:-/root}/.remote-bash/${SAFE_NAME}.sock"
+  fi
+}
 
 # ---------------------------------------------------------------- 设备注册
 pair_now() {
   [[ -n "$TOKEN" ]] && return 0
+  # 已配过对（agent 把 token 存在 ~/.remote-bash/<name>.token）：重装升级直接跳过，
+  # 不然每次重跑都要重新等管理员点允许（token 失效时 agent 自己会重新配对）
+  if [[ -s "${HOME:-/root}/.remote-bash/${SAFE_NAME}.token" ]]; then
+    echo "==> 已有设备 token（${HOME:-/root}/.remote-bash/${SAFE_NAME}.token），跳过注册"
+    return 0
+  fi
   echo "==> 设备注册（前台拿 token）"
   echo "    稍后会打印一个链接，用浏览器打开并点「允许」即可，无需手工填 token。"
   local rc=0
@@ -173,13 +240,14 @@ pair_now() {
 # ---------------------------------------------------------------- systemd
 install_systemd() {
   echo "==> 安装 systemd 服务 $UNIT"
-  fetch remote-bash-agent.service "/etc/systemd/system/$UNIT" || { echo "下载 unit 失败" >&2; exit 1; }
+  mv -f "${UNIT_PATH}.new" "$UNIT_PATH"
   systemctl daemon-reload
 
   pair_now
 
-  echo "==> 启用并启动"
-  systemctl enable --now "$UNIT" || true
+  echo "==> 启用并重启（restart 确保已在跑的服务也换成新代码）"
+  systemctl enable "$UNIT" >/dev/null 2>&1 || true
+  systemctl restart "$UNIT" || true
   sleep 2
   systemctl status "$UNIT" --no-pager 2>&1 | head -12 || true
 
@@ -189,15 +257,14 @@ install_systemd() {
   echo "  journalctl -u $UNIT -f         # 实时日志"
   echo "  systemctl edit    $UNIT        # 修改参数（或编辑 $ENVFILE 后 systemctl restart $UNIT）"
   echo "  重新注册/换 token: python3 $BIN --pair ${DEPLOY_ARGS[*]}"
-  echo "  systemctl restart $UNIT        # 只重启客户端，不会打断/杀死 tty 里正在跑的任务"
+  echo "  systemctl restart $UNIT        # 重启客户端（daemon 也会一并重建，tty 会话重开）"
   echo "  彻底结束某会话: systemctl stop $UNIT && pkill -f 'remote-bash-agent.py --daemon --name 名称'"
-  echo "  名称: ${NAME:-<主机名>}  地址: $URL  心跳: ${HEARTBEAT}s${PROXY:+  代理: $PROXY}"
+  echo "  名称: ${NAME}  地址: $URL  心跳: ${HEARTBEAT}s${PROXY:+  代理: $PROXY}  agent: ${AGENT_VERSION:-?}"
+  echo "  升级：直接重跑本脚本（不加参数也会沿用上面的配置）"
 }
 
 # ---------------------------------------------------------------- docker（无 systemd）
-install_docker() {
-  echo "==> 安装容器模式（无 systemd）"
-
+write_runner_and_ctl() {
   # 1) 看护进程：客户端退出 5 秒后重启；daemon 独立进程，不受影响
   cat > "$RUNNER" <<'RUNNER_EOF'
 #!/bin/sh
@@ -309,24 +376,16 @@ case "\${1:-status}" in
 esac
 CTL_EOF
   chmod +x "$CTL"
+}
 
-  # 幂等：重装时先停掉已在跑的看护进程（daemon 不杀，tty 会话照旧保留）
-  if [[ -x "$CTL" ]]; then "$CTL" stop >/dev/null 2>&1 || true; fi
-  pkill -f "remote-bash-agent-run.sh" 2>/dev/null || true
-  sleep 1
+install_docker() {
+  echo "==> 安装容器模式（无 systemd）"
+  write_runner_and_ctl
 
   pair_now
 
-  echo "==> 启动看护进程"
-  mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
-  setsid nohup sh "$RUNNER" >>"$LOGFILE" 2>&1 </dev/null &
-  echo $! > "$PIDFILE"
-  sleep 2
-  if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo "    已在后台运行 (pid $(cat "$PIDFILE"))"
-  else
-    echo "⚠ 启动失败，查看：tail -n 50 $LOGFILE" >&2
-  fi
+  echo "==> 启动看护进程（走 ctl，和手动管理同一条路）"
+  "$CTL" start || true
   echo "--- 最近日志 ---"
   tail -n 8 "$LOGFILE" 2>/dev/null || true
 
@@ -338,7 +397,8 @@ CTL_EOF
   echo "  $CTL stop          # 停客户端（daemon/tty 保留）"
   echo "  彻底结束某会话: $CTL stop && pkill -f 'remote-bash-agent.py --daemon --name 名称'"
   echo "  重新注册/换 token: python3 $BIN --pair ${DEPLOY_ARGS[*]}"
-  echo "  名称: ${NAME:-<主机名>}  地址: $URL  心跳: ${HEARTBEAT}s${PROXY:+  代理: $PROXY}"
+  echo "  名称: ${NAME}  地址: $URL  心跳: ${HEARTBEAT}s${PROXY:+  代理: $PROXY}  agent: ${AGENT_VERSION:-?}"
+  echo "  升级：直接重跑本脚本（不加参数也会沿用上面的配置；daemon 会一并重建）"
   echo
   echo "docker 提示："
   echo "  · 容器重启后 /etc/remote-bash-agent.env 和 ~/.remote-bash/<名称>.token 都会丢；"
@@ -355,9 +415,42 @@ install_foreground() {
   exec python3 "$BIN" "${DEPLOY_ARGS[@]}"
 }
 
+# ---------------------------------------------------------------- 主流程：下载校验 → 停旧 → 换新 → 写配置 → 启动
+case "$DEPLOY" in
+  systemd|docker|foreground) ;;
+  *) echo "未知部署模式: $DEPLOY" >&2; exit 1 ;;
+esac
+
+if [[ "$DEPLOY" == "docker" ]]; then
+  write_runner_and_ctl
+fi
+
+stop_existing_client
+kill_agent_for_name
+
+mv -f "$BIN_NEW" "$BIN"
+chmod +x "$BIN"
+python3 -m py_compile "$BIN"
+
+echo "==> 写环境配置 $ENVFILE"
+cat > "$ENVFILE" <<EOF
+REMOTE_BASH_NAME=${NAME}
+REMOTE_BASH_URL=${URL}
+REMOTE_BASH_TOKEN=${TOKEN}
+REMOTE_BASH_PROXY=${PROXY}
+REMOTE_BASH_HEARTBEAT=${HEARTBEAT}
+REMOTE_BASH_SHELL=${SHELL_CMD}
+EOF
+chmod 600 "$ENVFILE"
+
+# 组装客户端参数（数组，避免名称/代理里带空格时被拆开）
+DEPLOY_ARGS=(--url "$URL" --heartbeat "$HEARTBEAT")
+if [[ -n "$NAME" ]]; then DEPLOY_ARGS+=(--name "$NAME"); fi
+if [[ -n "$PROXY" ]]; then DEPLOY_ARGS+=(--proxy "$PROXY"); fi
+if [[ -n "$SHELL_CMD" ]]; then DEPLOY_ARGS+=(--shell "$SHELL_CMD"); fi
+
 case "$DEPLOY" in
   systemd) install_systemd ;;
   docker) install_docker ;;
   foreground) install_foreground ;;
-  *) echo "未知部署模式: $DEPLOY" >&2; exit 1 ;;
 esac

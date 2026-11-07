@@ -32,6 +32,7 @@ import json
 import os
 import platform
 import random
+import re
 import select
 import signal
 import socket
@@ -69,6 +70,7 @@ SCROLLBACK_KB = _env_int('REMOTE_BASH_SCROLLBACK', 4096)   # 默认 4MB
 SCROLLBACK_LIMIT = SCROLLBACK_KB * 1024
 # daemon -> client 的初始回放分块（避免一次性几 MB 的帧）
 REPLAY_CHUNK = 256 * 1024
+REPLAY_ALIGN_MAX = 1024
 HANDSHAKE_TIMEOUT = 15      # WebSocket 握手超时（秒）
 def _local_user():
     try:
@@ -77,7 +79,7 @@ def _local_user():
     except Exception:
         return ''
 
-VERSION = '1.5.0'            # 客户端版本（服务端列表里可看出谁还是旧脚本）
+VERSION = '1.6.2'            # 客户端版本（服务端列表里可看出谁还是旧脚本）
 DEFAULT_HEARTBEAT = 15      # 秒
 # daemon -> client 发送队列水位：超过后暂停读 pty（pty 满则 shell 阻塞，不丢数据）
 CLIENT_HIGH_WATER = 512 * 1024
@@ -88,6 +90,45 @@ CLIENT_OUTBUF_LIMIT = 8 * 1024 * 1024
 FRAME_DATA = 0x01   # payload: 裸 tty 字节
 FRAME_RESIZE = 0x02  # payload: struct '<HH' (cols, rows)
 FRAME_HELLO = 0x03  # client -> daemon: payload: 名称（UTF-8）
+
+# ---------- DEC 私有模式跟踪与补发 ----------
+# 这些模式只活在输出流里，xterm 是边收边记的。重连只回放 scrollback 尾部，应用启动时
+# 那句 ESC[?2004h（bracketed paste）早被挤出去 —— 浏览器新 xterm 于是以为应用没开
+# bracketed paste，粘贴多行文本就把换行当裸 CR 发（每行一次回车，远端 pi 里就是被逐行
+# 提交，而不是折叠成 [paste #N]）。所以这里跟踪模式，client 接入时先补发再回放。
+# 备用屏/同步刷新类不补发：补发 1049h 会让「重连能看到历史回放」变成只剩一屏。
+MODE_TAIL_MAX = 64
+MODE_RESTORE_SKIP = frozenset((3, 6, 47, 66, 1047, 1048, 1049, 2026))
+MODE_RE = re.compile(rb'\x1b\[\?([0-9]{1,4}(?:;[0-9]{1,4})*)([hl])')
+
+
+def scan_modes(state, chunk):
+    """更新 state['modes']（幂等；转义序列被读断也能靠尾部缓存接上）。"""
+    if not chunk:
+        return
+    text = state['tail'] + chunk
+    for m in MODE_RE.finditer(text):
+        on = m.group(2) == b'h'
+        for part in m.group(1).split(b';'):
+            try:
+                n = int(part)
+            except ValueError:
+                continue
+            if n <= 0:
+                continue
+            if on:
+                state['modes'].add(n)
+            else:
+                state['modes'].discard(n)
+    state['tail'] = text[-MODE_TAIL_MAX:]
+
+
+def mode_restore_seq(state):
+    """生成「把当前模式补一遍」的字节串；没有可补的返回 b''。"""
+    nums = sorted(n for n in state['modes'] if n not in MODE_RESTORE_SKIP)
+    if not nums:
+        return b''
+    return ('\x1b[?%sh' % ';'.join(str(n) for n in nums)).encode()
 
 
 # --------------------------------------------------------------------------
@@ -107,6 +148,7 @@ class TtyDaemon:
         self._buf = b''
         self.scrollback = bytearray()   # 最近输出，用于新 client 连接时回放（保持屏幕内容）
         self.scrollback_limit = scrollback_limit or SCROLLBACK_LIMIT
+        self.mode_state = {'modes': set(), 'tail': b''}  # 见 scan_modes
 
     # ---- pty ----
     def _spawn_shell(self):
@@ -238,10 +280,17 @@ class TtyDaemon:
             data = b''
         if not data:
             return
+        # 记录 DEC 私有模式（bracketed paste / 鼠标 …），新 client 接入时要补发
+        scan_modes(self.mode_state, data)
         # 累积最近输出供回放（环形，上限 SCROLLBACK_LIMIT）
         self.scrollback += data
         over = len(self.scrollback) - self.scrollback_limit
         if over > 0:
+            # 裁剪点对齐到最近的 ESC：硬切会把转义序列切成两半，回放时那半截没有
+            # ESC 开头，xterm 只会把 `2;176;196;124m` 之类按字面打印出来
+            idx = self.scrollback.rfind(b'\x1b', max(0, over - REPLAY_ALIGN_MAX), over)
+            if idx != -1:
+                over = idx
             del self.scrollback[:over]
         frame = self.encode_frame(FRAME_DATA, data)
         for pair in list(self.clients):
@@ -283,7 +332,10 @@ class TtyDaemon:
 
 
     def _queue_replay(self, pair):
-        """把最近输出按 REPLAY_CHUNK 分块入队（避免单帧过大）"""
+        """回放前先补发应用当前的 DEC 私有模式，再按 REPLAY_CHUNK 分块回放内容。"""
+        restore = mode_restore_seq(self.mode_state)
+        if restore:
+            pair[2] += self.encode_frame(FRAME_DATA, restore)
         if not self.scrollback:
             return
         data = bytes(self.scrollback)
@@ -307,10 +359,28 @@ class TtyDaemon:
     def _write_master(self, data):
         if self.master is None:
             return
-        try:
-            os.write(self.master, data)
-        except OSError:
-            pass
+        # master 是非阻塞 fd：os.write 可能只写进一部分（pty 缓冲满时返回
+        # 短写），只写一次会把超长单行命令/粘贴的后半截静默丢掉
+        # （表现为远端只收到一半）。必须循环写完剩余部分。
+        view = memoryview(data)
+        off = 0
+        while off < len(view):
+            try:
+                n = os.write(self.master, view[off:])
+            except BlockingIOError:
+                # 缓冲满：等可写再继续（shell 读走后自然腾空）
+                try:
+                    select.select([], [self.master], [], 5)
+                except (OSError, ValueError):
+                    break
+                continue
+            except InterruptedError:
+                continue
+            except OSError:
+                break
+            if n <= 0:
+                break
+            off += n
 
     def _shell_alive(self):
         if self.pid is None:
@@ -653,6 +723,22 @@ class WsClient:
     def send(self, obj):
         return self.send_text(json.dumps(obj, ensure_ascii=False))
 
+    def send_binary(self, payload):
+        """发二进制帧：终端输出走这里，省掉 base64 的三成体积和两次编解码"""
+        if self.ws is not None:
+            try:
+                self.ws.send(payload, opcode=0x2)
+                return True
+            except Exception:
+                return False
+        if self.raw is None:
+            return False
+        try:
+            self.raw.sendall(self._frame(payload, opcode=0x2))
+            return True
+        except OSError:
+            return False
+
     # ---- 接收 ----------------
     def poll(self, timeout=0.0):
         """底层 socket 是否可读（用于非阻塞轮询，避免 settimeout(0) 抛 BlockingIOError）"""
@@ -671,13 +757,18 @@ class WsClient:
         if not self.poll(timeout):
             raise TimeoutError
         if self.ws is not None:
-            try:
-                raw = self.ws.recv()
-            except Exception as e:
-                raise ConnectionError(str(e))
-            if isinstance(raw, bytes):
-                raw = raw.decode('utf-8', errors='replace')
-            return raw
+            # 文本帧 = 控制消息（str）；二进制帧 = 终端输入（bytes，原样返回）
+            while True:
+                try:
+                    frame = self.ws.recv_data(control_frame=True)
+                except Exception as e:
+                    raise ConnectionError(str(e))
+                opcode, payload = frame
+                if opcode == 0x1:
+                    return payload.decode('utf-8', errors='replace')
+                if opcode == 0x2:
+                    return payload
+                # ping/pong 等：继续读下一条
 
         if self.raw is None:
             raise ConnectionError('未连接')
@@ -741,19 +832,26 @@ class WsClient:
                 continue
             if opcode == 0x8:  # close
                 raise ConnectionError('对端关闭连接')
-            if opcode == 0x1:  # text
+            if opcode == 0x1:  # text（控制消息）
                 if fin:
                     return payload.decode('utf-8', errors='replace')
                 self._frag = payload
+                self._frag_bin = False
+                continue
+            if opcode == 0x2:  # binary（终端输入）
+                if fin:
+                    return payload
+                self._frag = payload
+                self._frag_bin = True
                 continue
             if opcode == 0x0 and hasattr(self, '_frag'):  # continuation
                 self._frag += payload
                 if fin:
-                    txt = self._frag.decode('utf-8', errors='replace')
+                    data = self._frag
+                    is_bin = getattr(self, '_frag_bin', False)
                     del self._frag
-                    return txt
+                    return data if is_bin else data.decode('utf-8', errors='replace')
                 continue
-            # 二进制等其他帧忽略
 
     # ---- 关闭 ----------------
     def close(self):
@@ -792,6 +890,7 @@ class AgentLoop:
         self.history = bytearray()   # 最近 tty 输出，重连后先补发给服务端回放
         self.scrollback_limit = scrollback_limit or SCROLLBACK_LIMIT
         self.registered = False
+        self.peer_bin = False   # 服务端是否也支持二进制帧（hello 应答里回执）
         self.ok_count = 0            # 注册成功次数（用于判断是否真的连上 past）
         self.last_beat = 0.0
 
@@ -826,6 +925,7 @@ class AgentLoop:
                     'heartbeat': self.heartbeat,
                     'version': VERSION,
                     'scrollback_kb': max(16, self.scrollback_limit // 1024),
+                    'bin': 1,
                     'token': self.token or None,
                 })
                 self.last_beat = time.time()
@@ -886,7 +986,10 @@ class AgentLoop:
                 return  # 断开 -> 外层重连
             if raw:
                 try:
-                    self._handle_msg(json.loads(raw))
+                    if isinstance(raw, bytes):
+                        self._handle_input(raw)
+                    else:
+                        self._handle_msg(json.loads(raw))
                 except Exception as e:
                     print(f'[remote-bash] 消息处理异常: {e}', file=sys.stderr)
 
@@ -902,21 +1005,39 @@ class AgentLoop:
                 print('[remote-bash] daemon tty 连接断开')
                 return
 
+    def _send_data(self, chunk, hist=False, reset=False):
+        """实时输出走二进制帧（服务端支持时，省掉 base64）；历史回放带着 hist/reset
+        标记，量不大且是一次性的，继续用 JSON 以免标记和数据分帧配对。"""
+        if hist or reset or not self.peer_bin:
+            msg = {'type': 'data', 'data': base64.b64encode(chunk).decode()}
+            if hist:
+                msg['hist'] = True
+            if reset:
+                msg['reset'] = True
+            return self.ws.send(msg)
+        return self.ws.send_binary(bytes(chunk))
+
     def _flush(self):
         while len(self.pending) >= 8192:
             chunk = self.pending[:8192]
             self.pending = self.pending[8192:]
-            if not self.ws.send({'type': 'data', 'data': base64.b64encode(chunk).decode()}):
+            if not self._send_data(chunk):
                 return
         if self.pending:
-            if not self.ws.send({'type': 'data', 'data': base64.b64encode(self.pending).decode()}):
+            if not self._send_data(self.pending):
                 return
             self.pending = b''
+
+    def _handle_input(self, raw):
+        """二进制输入帧：原样写进 tty（不再 base64）"""
+        if raw:
+            self.tty.write(raw)
 
     def _handle_msg(self, m):
         t = m.get('type')
         if t == 'hello':
             if m.get('ok'):
+                self.peer_bin = bool(m.get('bin'))
                 self.registered = True
                 self.ok_count += 1
                 self.last_beat = time.time()
@@ -928,10 +1049,7 @@ class AgentLoop:
                     hist = bytes(self.history)
                     # reset=True 让服务端用这份历史替换旧缓冲（否则每次重连都追加一遍）
                     for i in range(0, len(hist), REPLAY_CHUNK):
-                        self.ws.send({'type': 'data',
-                                      'hist': True,
-                                      'reset': i == 0,
-                                      'data': base64.b64encode(hist[i:i + REPLAY_CHUNK]).decode()})
+                        self._send_data(hist[i:i + REPLAY_CHUNK], hist=True, reset=i == 0)
                 self.pending = b''
             else:
                 print(f'[remote-bash] 注册被拒: {m.get("error")}', file=sys.stderr)
