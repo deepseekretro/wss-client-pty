@@ -70,6 +70,13 @@ SCROLLBACK_LIMIT = SCROLLBACK_KB * 1024
 # daemon -> client 的初始回放分块（避免一次性几 MB 的帧）
 REPLAY_CHUNK = 256 * 1024
 HANDSHAKE_TIMEOUT = 15      # WebSocket 握手超时（秒）
+def _local_user():
+    try:
+        import getpass
+        return getpass.getuser() or ''
+    except Exception:
+        return ''
+
 VERSION = '1.5.0'            # 客户端版本（服务端列表里可看出谁还是旧脚本）
 DEFAULT_HEARTBEAT = 15      # 秒
 # daemon -> client 发送队列水位：超过后暂停读 pty（pty 满则 shell 阻塞，不丢数据）
@@ -814,7 +821,7 @@ class AgentLoop:
                 print(f'[remote-bash] 已连接 {self.url}')
                 self.ws.send({
                     'type': 'hello', 'role': 'agent',
-                    'name': self.name, 'host': self.host,
+                    'name': self.name, 'host': self.host, 'user': _local_user(),
                     'os': self.os_name, 'arch': self.arch,
                     'heartbeat': self.heartbeat,
                     'version': VERSION,
@@ -1161,7 +1168,7 @@ def pair_device(ws_url, name, proxy='', interval=2, timeout_sec=600):
         code, obj = http_json(
             f'{base}/api/remote/pair/start',
             {'name': name, 'host': socket.gethostname() or '',
-             'os': platform.system() or '', 'arch': platform.machine() or ''},
+             'os': platform.system() or '', 'arch': platform.machine() or '', 'user': _local_user()},
             proxy=proxy,
         )
     except Exception as e:
