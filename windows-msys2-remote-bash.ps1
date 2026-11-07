@@ -71,9 +71,9 @@ if (-not (Test-Path $BashExe)) {
 # --- 2. MSYS2 里装 python3（remote-bash agent 的运行时） ---
 Write-Host "[2/4] pacman 安装 python3 ..."
 Run-MsysBash 'pacman -Sy --noconfirm --needed python3'
-Run-MsysBash 'python3 --version && python3 -c "import pty; print(\"pty OK\")"'
+Run-MsysBash '/usr/bin/python3 --version && /usr/bin/python3 -c "import pty; print(\"pty OK\")"'
 # 可选：websocket-client 不装也能跑（agent 有标准库兜底），装上更稳
-Run-MsysBash 'for P in python-websocket-client mingw-w64-x86_64-python-websocket-client mingw-w64-ucrt-x86_64-python-websocket-client; do pacman -Sy --noconfirm --needed $P && break; done; python3 -m pip install --user -q websocket-client || true'
+Run-MsysBash 'export PATH=/usr/bin:$PATH; for P in python-websocket-client mingw-w64-x86_64-python-websocket-client mingw-w64-ucrt-x86_64-python-websocket-client; do pacman -Sy --noconfirm --needed $P && break; done; /usr/bin/python3 -m pip install --user -q websocket-client || true'
 
 # --- 3. 把 agent 拷进 MSYS2 ---
 Write-Host "[3/4] 部署 remote-bash-agent.py ..."
@@ -85,13 +85,13 @@ if (-not (Test-Path $AgentPath)) {
     throw "找不到 agent：$AgentPath（请把 remote-bash-agent.py 放到本脚本同目录，或用 -AgentPath/-AgentUrl 指定）"
   }
 }
-Run-MsysBash "cp '$(($AgentPath -replace '\\','/'))' ~/remote-bash-agent.py && python3 -m py_compile ~/remote-bash-agent.py && echo agent-ok"
+Run-MsysBash "export PATH=/usr/bin:$PATH; cp '$(($AgentPath -replace '\\','/'))' ~/remote-bash-agent.py && /usr/bin/python3 -m py_compile ~/remote-bash-agent.py && echo agent-ok"
 
 # 启动脚本（在 MSYS2 里跑 agent；shell 固定 /usr/bin/bash）
 $envLine = "export REMOTE_BASH_URL='$Url'`nexport REMOTE_BASH_NAME='$Name'`n"
 if ($Token)  { $envLine += "export REMOTE_BASH_TOKEN='$Token'`n" }
 if ($Proxy)  { $envLine += "export REMOTE_BASH_PROXY='$Proxy'`n" }
-$envLine += "export REMOTE_BASH_SHELL='/usr/bin/bash'`nexec python3 ~/remote-bash-agent.py --url `"$Url`" --name `"$Name`""
+$envLine += "export REMOTE_BASH_SHELL='/usr/bin/bash'`nexec /usr/bin/python3 ~/remote-bash-agent.py --url `"$Url`" --name `"$Name`""
 Set-Content -Path (Join-Path $Msys2Root 'home\remote-bash-run.sh') -Value ("#!/bin/bash`n" + $envLine) -Encoding Ascii
 Run-MsysBash 'chmod +x ~/remote-bash-run.sh'
 

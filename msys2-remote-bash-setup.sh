@@ -37,25 +37,34 @@ case "$(uname -s)" in
   *) echo "!! 请在 MSYS2 bash 里运行（uname -s 应为 MSYS_NT...）" >&2; exit 1 ;;
 esac
 
-echo "[1/4] 安装 python3（已装跳过）..."
-if ! command -v python3 >/dev/null 2>&1; then
+# 注意：UCRT64/MINGW 的 python3 是 Windows 原生移植版，没有 termios/pty，跑不了 remote-bash 的 tty。
+# 必须用 MSYS 的 /usr/bin/python3（POSIX 版）。PATH 把 /usr/bin 排前面，避免被 ucrt64/bin 的 python3 抢走。
+export PATH="/usr/bin:$PATH"
+hash -r 2>/dev/null || true
+echo "[1/4] 安装 python3（MSYS 版，已装跳过）..."
+if [ ! -x /usr/bin/python3 ]; then
   pacman -Sy --noconfirm --needed python3 || { echo "!! python3 安装失败"; exit 1; }
 fi
-python3 --version
-python3 -c "import pty; print('pty OK')"
+PYTHON=/usr/bin/python3
+"$PYTHON" --version
+if ! "$PYTHON" -c "import pty" 2>/dev/null; then
+  echo "!! $PYTHON 没有 termios（可能误用了 UCRT64 的 python）。请在 MSYS2 子系统 shell（不是 UCRT64/MINGW64）里重跑本脚本。" >&2
+  exit 1
+fi
+echo "pty OK ($PYTHON)"
 # websocket-client 可选：agent 有标准库兜底，装不上不拦
 WS_OK=0
 for PKG in python-websocket-client mingw-w64-x86_64-python-websocket-client mingw-w64-ucrt-x86_64-python-websocket-client; do
   if pacman -Sy --noconfirm --needed "$PKG" >/dev/null 2>&1; then WS_OK=1; break; fi
 done
-[ "$WS_OK" = "1" ] || python3 -m pip install --user -q websocket-client >/dev/null 2>&1 && WS_OK=1 || true
+[ "$WS_OK" = "1" ] || "$PYTHON" -m pip install --user -q websocket-client >/dev/null 2>&1 && WS_OK=1 || true
 [ "$WS_OK" = "1" ] && echo "websocket-client OK" || echo "[!] websocket-client 未装（标准库兜底，可跑）"
 
 echo "[2/4] 部署 remote-bash-agent.py ..."
 if [ ! -f ~/remote-bash-agent.py ] || [ "${REMOTE_BASH_UPDATE_AGENT:-1}" = "1" ]; then
   curl -fsSL "$AGENT_URL" -o ~/remote-bash-agent.py || wget -q -O ~/remote-bash-agent.py "$AGENT_URL" || { echo "!! agent 下载失败"; exit 1; }
 fi
-python3 -m py_compile ~/remote-bash-agent.py && echo "agent-ok"
+"$PYTHON" -m py_compile ~/remote-bash-agent.py && echo "agent-ok"
 
 echo "[3/4] 生成启动脚本 ~/remote-bash-run.sh ..."
 cat > ~/remote-bash-run.sh <<EOF
@@ -65,7 +74,7 @@ export REMOTE_BASH_NAME='$NAME'
 export REMOTE_BASH_TOKEN='$TOKEN'
 export REMOTE_BASH_PROXY='$PROXY'
 export REMOTE_BASH_SHELL='/usr/bin/bash'
-exec python3 ~/remote-bash-agent.py --url '$URL' --name '$NAME'
+exec /usr/bin/python3 ~/remote-bash-agent.py --url '$URL' --name '$NAME'
 EOF
 chmod +x ~/remote-bash-run.sh
 
