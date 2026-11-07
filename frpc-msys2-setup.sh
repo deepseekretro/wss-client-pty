@@ -77,13 +77,13 @@ if command -v ssh-host-config >/dev/null 2>&1; then
   ssh-host-config -y >/dev/null 2>&1 || echo "[!] ssh-host-config 未完全成功，继续手动配置"
 fi
 [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A >/dev/null 2>&1 || true
-/usr/sbin/sshd -t 2>&1 || { echo "!! sshd 配置校验失败"; exit 1; }
-SSHD_PORT=$(/usr/sbin/sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')
+"$SSHD_BIN" -t 2>&1 || { echo "!! sshd 配置校验失败"; exit 1; }
+SSHD_PORT=$("$SSHD_BIN" -T 2>/dev/null | awk '$1=="port"{print $2; exit}')
 [ -n "$SSHD_PORT" ] || SSHD_PORT=22
 echo "sshd 端口: $SSHD_PORT"
 
 echo "[3/5] 启动 MSYS2 sshd（Windows 服务，需管理员）..."
-SSD_WIN=$(cygpath -w /usr/sbin/sshd.exe 2>/dev/null || cygpath -w /usr/sbin/sshd 2>/dev/null || echo "")
+SSD_WIN=$(cygpath -w "$SSHD_BIN" 2>/dev/null || cygpath -w /usr/sbin/sshd 2>/dev/null || echo "")
 if [ -n "$SSD_WIN" ]; then
   BINPATH=$(printf '%c%s -D%c' 34 "$SSD_WIN" 34)
   sc.exe create sshd binPath= "$BINPATH" start= auto >/dev/null 2>&1 || true
