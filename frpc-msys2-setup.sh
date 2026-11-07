@@ -54,9 +54,12 @@ if [ ! -x "$FRPC_BIN" ]; then
   else echo "!! 没有 curl/wget"; exit 1; fi
   if command -v unzip >/dev/null 2>&1; then
     unzip -q -o "$TMP/frp.zip" -d "$TMP" || { echo "!! 解压失败"; exit 1; }
+  elif [ -x /usr/bin/python3 ]; then
+    /usr/bin/python3 -m zipfile -e "$TMP/frp.zip" "$TMP" || { echo "!! 解压失败"; exit 1; }
   elif command -v powershell.exe >/dev/null 2>&1; then
-    powershell.exe -NoProfile -Command "Expand-Archive -Force '$TMP/frp.zip' '$TMP'" || { echo "!! 解压失败"; exit 1; }
-  else echo "!! 没有 unzip/powershell"; exit 1; fi
+    WPKG=$(cygpath -w "$TMP/frp.zip"); WTMP=$(cygpath -w "$TMP")
+    powershell.exe -NoProfile -Command "Expand-Archive -Force '$WPKG' '$WTMP'" || { echo "!! 解压失败"; exit 1; }
+  else echo "!! 没有 unzip/python3/powershell"; exit 1; fi
   install -m 755 "$TMP"/frp_*_windows_*/frpc.exe /opt/frp/frpc.exe || { echo "!! 安装失败"; exit 1; }
   rm -rf "$TMP"
 else
