@@ -33,6 +33,20 @@ python3 remote-bash-agent.py --name mac-air --proxy http://127.0.0.1:3128
 
 然后浏览器打开 workbench → 顶部 **remote bash** → 左侧出现这台机器 → 点击即可控制其 tty。
 
+
+## Windows 一键链路（PowerShell -> MSYS2 -> python3 -> remote-bash）
+
+真 Windows 机器上，管理员 PowerShell 里一行装好 MSYS2，再在 MSYS2 里装 python3 提供 remote-bash（tty 就是 MSYS2 bash）：
+
+```powershell
+irm https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/windows-msys2-remote-bash.ps1 | iex
+# 带参数：(irm https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/windows-msys2-remote-bash.ps1) -Name win-pc -Token <设备token>
+```
+
+脚本会：静默装官方 MSYS2 到 `C:\msys64`（已装跳过）→ MSYS2 bash 里 `pacman -S python3`（含 pty）→ 下载本仓库的 `remote-bash-agent.py` → 注册计划任务 `RemoteBashAgent`（登录自启）并立即启动。不给 `-Token` 时首次运行会打印配对链接，需在面板批准。agent 数据在 MSYS2 家目录 `~/.remote-bash/`。
+
+如需 frp SSH 隧道，另见 `frpc-msys2-setup.sh`（MSYS2 openssh 版）。
+
 ## 一键安装（systemd 机器 / docker 容器都能用）
 
 脚本会自己判断环境：**有运行中的 systemd 就装 systemd 服务，没有（容器/精简镜像）就自动切到容器模式**，
