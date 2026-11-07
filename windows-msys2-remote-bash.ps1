@@ -18,7 +18,11 @@
      不是 Windows 原生 python（无 pty）。
 
 .NOTES
-  需要管理员权限（装 MSYS2、注册计划任务）。脚本可重复执行。
+  需要管理员权限（装 MSYS2、注册计划任务）。脚本可重复执行（= 原地升级）：
+  没显式给的参数会沿用上次写入的 remote-bash-run.sh 里的旧值（名称/地址/token/代理）；
+  agent 每次运行都重新下载（irm 模式）；启动前会停旧 client 并重启 daemon
+  （修复在 daemon 里，只重启 client 不生效；-KeepDaemon 可保留 tty 会话，但不升级）。
+  注意：从 remote-bash 自己的终端里重装会杀掉当前 tty，请先 detached 运行。
 #>
 param(
   [string]$Name = $env:COMPUTERNAME,
@@ -27,7 +31,8 @@ param(
   [string]$Proxy = '',
   [string]$AgentPath = '',
   [string]$AgentUrl = 'https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/remote-bash-agent.py',
-  [string]$Msys2Root = 'C:\msys64'
+  [string]$Msys2Root = 'C:\msys64',
+  [switch]$KeepDaemon
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,6 +49,24 @@ if (-not $isAdmin) { Write-Warning '建议以管理员身份运行（装 MSYS2 /
 
 if (-not $Name) { $Name = $env:COMPUTERNAME }
 $BashExe = Join-Path $Msys2Root 'usr\bin\bash.exe'
+$RunShWindows = Join-Path $Msys2Root 'home\remote-bash-run.sh'
+
+# --- 沿用上次安装的配置：没显式传的参数不覆盖旧值（可重入的关键） ---
+if (Test-Path $RunShWindows) {
+  $old = Get-Content -Raw -Path $RunShWindows
+  if (-not $PSBoundParameters.ContainsKey('Name')) {
+    if ($old -match "export REMOTE_BASH_NAME='([^']*)'") { $Name = $Matches[1] }
+  }
+  if (-not $PSBoundParameters.ContainsKey('Url')) {
+    if ($old -match "export REMOTE_BASH_URL='([^']*)'") { $Url = $Matches[1] }
+  }
+  if (-not $PSBoundParameters.ContainsKey('Proxy')) {
+    if ($old -match "export REMOTE_BASH_PROXY='([^']*)'") { $Proxy = $Matches[1] }
+  }
+  if (-not $PSBoundParameters.ContainsKey('Token') -and -not $Token) {
+    if ($old -match "export REMOTE_BASH_TOKEN='([^']*)'") { $Token = $Matches[1] }
+  }
+}
 
 function Run-MsysBash([string]$Cmd) {
   Write-Host "  [msys] $Cmd"
@@ -77,7 +100,16 @@ Run-MsysBash 'export PATH=/usr/bin:$PATH; for P in python-websocket-client mingw
 
 # --- 3. 把 agent 拷进 MSYS2 ---
 Write-Host "[3/4] 部署 remote-bash-agent.py ..."
-if (-not (Test-Path $AgentPath)) {
+# irm 模式（AgentPath 在 TEMP）每次都重新下载，升级不依赖上次的旧副本；
+# 本地文件模式则用脚本同目录的 remote-bash-agent.py（请先 git pull 仓库再跑）
+$DownloadAgent = -not $PSScriptRoot
+if ($DownloadAgent) {
+  if (-not $AgentUrl) { throw "AgentUrl 为空，无法下载 agent" }
+  Write-Host "从 $AgentUrl 下载 agent ..."
+  $tmpAgent = "$AgentPath.new"
+  Invoke-WebRequest -Uri $AgentUrl -OutFile $tmpAgent -UseBasicParsing
+  Move-Item -Force -Path $tmpAgent -Destination $AgentPath
+} elseif (-not (Test-Path $AgentPath)) {
   if ($AgentUrl) {
     Write-Host "从 $AgentUrl 下载 agent ..."
     Invoke-WebRequest -Uri $AgentUrl -OutFile $AgentPath -UseBasicParsing
@@ -85,6 +117,8 @@ if (-not (Test-Path $AgentPath)) {
     throw "找不到 agent：$AgentPath（请把 remote-bash-agent.py 放到本脚本同目录，或用 -AgentPath/-AgentUrl 指定）"
   }
 }
+$verLine = Select-String -Path $AgentPath -Pattern "^VERSION = '([^']+)'" | Select-Object -First 1
+if ($verLine) { Write-Host "  agent 版本: $($verLine.Matches[0].Groups[1].Value)" }
 Run-MsysBash "export PATH=/usr/bin:$PATH; cp '$(($AgentPath -replace '\\','/'))' ~/remote-bash-agent.py && /usr/bin/python3 -m py_compile ~/remote-bash-agent.py && echo agent-ok"
 
 # 启动脚本（在 MSYS2 里跑 agent；shell 固定 /usr/bin/bash）
@@ -92,8 +126,8 @@ $envLine = "export REMOTE_BASH_URL='$Url'`nexport REMOTE_BASH_NAME='$Name'`n"
 if ($Token)  { $envLine += "export REMOTE_BASH_TOKEN='$Token'`n" }
 if ($Proxy)  { $envLine += "export REMOTE_BASH_PROXY='$Proxy'`n" }
 $envLine += "export REMOTE_BASH_SHELL='/usr/bin/bash'`nexec /usr/bin/python3 ~/remote-bash-agent.py --url `"$Url`" --name `"$Name`""
-Set-Content -Path (Join-Path $Msys2Root 'home\remote-bash-run.sh') -Value ("#!/bin/bash`n" + $envLine) -Encoding Ascii
-Run-MsysBash 'chmod +x ~/remote-bash-run.sh'
+Set-Content -Path $RunShWindows -Value ("#!/bin/bash`n" + $envLine) -Encoding Ascii
+Run-MsysBash 'chmod +x /home/remote-bash-run.sh'
 
 # --- 4. 计划任务（登录自启）+ 立即启动 ---
 Write-Host "[4/4] 注册计划任务 RemoteBashAgent 并启动 ..."
@@ -104,6 +138,11 @@ try {
   Register-ScheduledTask -TaskName 'RemoteBashAgent' -Action $action -Trigger $trigger -Settings $settings -RunLevel Highest -Force | Out-Null
   Write-Host '计划任务 RemoteBashAgent 已注册（登录自启）'
 } catch { Write-Warning "计划任务注册失败（非管理员？）：$($_.Exception.Message)；将只做本次启动" }
+
+# 先停旧任务/旧进程：只起新 client 的话 daemon 还是旧代码（升级不生效）
+try { Stop-ScheduledTask -TaskName 'RemoteBashAgent' -ErrorAction SilentlyContinue } catch { }
+$stopDaemon = if ($KeepDaemon) { 'echo KeepDaemon: skip daemon kill' } else { "pkill -f 'remote-bash-agent[.]py --daemon --name $Name' 2>/dev/null || true" }
+Run-MsysBash "tmux kill-session -t remote-bash 2>/dev/null || true; $stopDaemon"
 
 # 立即起（新窗口，日志看 MSYS2 家目录的 .remote-bash/*.daemon.log）
 Start-Process -FilePath $BashExe -ArgumentList '-lc "/home/remote-bash-run.sh"' -WindowStyle Minimized

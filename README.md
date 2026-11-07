@@ -12,7 +12,7 @@
 
 - **daemon 架构**：常驻 daemon 进程持有 shell(tty)。客户端(agent)只是桥——**agent 退出 / 崩溃 / 重启，shell 会话仍在继续**，下次启动自动接回同一个会话，正在跑的命令不会中断。
 - **15 秒心跳**默认，保持长连接不被代理 / NAT 掐断（`--heartbeat` 可调）。
-- **HTTP 代理**支持（`--proxy http://127.0.0.1:3128`，走 CONNECT 隧道），且会注入持久 shell 环境：daemon 拉起的 shell 及其子进程（git/curl/pip/npm）自动走该代理，`NO_PROXY=localhost,127.0.0.1,::1` 避免本机流量被劫持。（已运行的旧 daemon 需重启服务重建：`systemctl restart remote-bash-agent`）
+- **HTTP 代理**支持（`--proxy http://127.0.0.1:3128`，走 CONNECT 隧道），且会注入持久 shell 环境：daemon 拉起的 shell 及其子进程（git/curl/pip/npm）自动走该代理，`NO_PROXY=localhost,127.0.0.1,::1` 避免本机流量被劫持。（daemon 代码升级请重跑安装脚本，`systemctl restart` 只重启 client，daemon 里的旧代码不会换）
 - **断线重连**：指数退避 + 抖动（2s → 30s，`RECONNECT_MAX`），连上后自动重置；断线期间 tty 输出暂存在内存（上限 1MB）后补发。
 - **daemon 崩了会自愈**：agent 发现本地 daemon 消失会自动重新拉起（无需人工介入，`systemctl restart` 都不用）。
 - **大输出不丢数据**：daemon 给每个 client 维护独立发送队列 + select 写就绪 + 反压（积压时暂停读 pty，由 pty 让 shell 自然阻塞），实测 `seq 1 300000`（≈2.3MB）**零丢块**、吞吐约 1–2MB/s。
@@ -22,8 +22,13 @@
 
 ## 快速开始（远端机器）
 
+**正式安装/升级一律走下面的安装脚本**（`install.sh`，Linux；Windows 见下一节的 ps1/msys2 脚本）:
+- 脚本在 `/usr/local/bin/`、开机自启、重跑即原地升级（沿用旧配置、重启 daemon）
+- 直接下载 `remote-bash-agent.py` 手动跑只适合**临时试用**：没有自启，而且升级只换 client 的话
+  daemon 仍是旧代码（`_write_master` 这类关键修复在 daemon 里），面板显示的版本号只反映 client
+
 ```bash
-# 方式一：下载脚本直接跑
+# 方式一：下载脚本直接跑（临时试用，不自启）
 curl -fsSL https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/remote-bash-agent.py -o remote-bash-agent.py
 python3 remote-bash-agent.py --name win10 --url wss://edge02.10w123.com/workbench/wss
 
@@ -44,6 +49,8 @@ irm https://raw.githubusercontent.com/deepseekretro/wss-client-pty/main/windows-
 ```
 
 脚本会：静默装官方 MSYS2 到 `C:\msys64`（已装跳过）→ MSYS2 bash 里 `pacman -S python3`（含 pty）→ 下载本仓库的 `remote-bash-agent.py` → 注册计划任务 `RemoteBashAgent`（登录自启）并立即启动。不给 `-Token` 时首次运行会打印配对链接，需在面板批准。agent 数据在 MSYS2 家目录 `~/.remote-bash/`。
+
+**可重复执行（= 原地升级）**：没显式给的参数会沿用上次写入的 `remote-bash-run.sh` 里的旧值（名称/地址/token/代理），agent 每次运行都重新下载，启动前会停旧 client 并重启 daemon（`-KeepDaemon` 可保留 tty 会话，但 daemon 代码不升级）。Windows 不用 Linux 的 `install.sh`，入口就是这个 ps1 / 下面的 msys2 脚本，升级方式相同：重跑一遍即可（从 remote-bash 自己的终端重装时请先 detached 运行，当前 tty 会被重启）。
 
 如需 frp SSH 隧道，另见 `frpc-msys2-setup.sh`（MSYS2 openssh 版）。
 
@@ -79,7 +86,8 @@ REMOTE_BASH_NAME=win10 REMOTE_BASH_PROXY=http://127.0.0.1:3128 \
 ```bash
 systemctl status  remote-bash-agent     # 状态
 journalctl -u remote-bash-agent -f      # 日志
-systemctl restart remote-bash-agent     # 重启（只重启客户端，tty 里的任务不受影响）
+systemctl restart remote-bash-agent     # 重启（只重启客户端，daemon/tty 里的任务不受影响）
+# 升级 agent 代码：重跑 install.sh（停旧进程 + 重启 daemon + 沿用旧配置），不要只重启 client
 ```
 
 ### docker / 容器（没有 systemd）
