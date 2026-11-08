@@ -82,7 +82,22 @@ fi
 "$SSHD_BIN" -t 2>&1 || { echo "!! sshd 配置校验失败"; exit 1; }
 SSHD_PORT=$("$SSHD_BIN" -T 2>/dev/null | awk '$1=="port"{print $2; exit}')
 [ -n "$SSHD_PORT" ] || SSHD_PORT=22
-echo "sshd 端口: $SSHD_PORT"
+echo "sshd 配置端口: $SSHD_PORT"
+# --- 用 ss 实际监听交叉核对（排除 X11 转发口 6000-6999；会话 sshd 的 X11 监听如 6010 不是 SSH 本体）---
+ACTUAL_PORT=$( (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null || ss -ltn 2>/dev/null) | grep -i sshd | grep -oE '[:.][0-9]+[[:space:]]' | tr -d ':. ' | awk '$1 < 6000 || $1 > 6999' | grep -x "$SSHD_PORT" | head -1 || true)
+if [ -z "$ACTUAL_PORT" ]; then
+  CANDIDATE=$( (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null || ss -ltn 2>/dev/null) | grep -i sshd | grep -oE '[:.][0-9]+[[:space:]]' | tr -d ':. ' | awk '$1 < 6000 || $1 > 6999' | sort -un | uniq | wc -l)
+  if [ "$CANDIDATE" = "1" ]; then
+    ACTUAL_PORT=$( (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null || ss -ltn 2>/dev/null) | grep -i sshd | grep -oE '[:.][0-9]+[[:space:]]' | tr -d ':. ' | awk '$1 < 6000 || $1 > 6999' | head -1)
+  fi
+fi
+if [ -n "$ACTUAL_PORT" ] && [ "$ACTUAL_PORT" != "$SSHD_PORT" ]; then
+  echo "sshd 配置端口 $SSHD_PORT 未在监听，实际在听 $ACTUAL_PORT，按实际端口映射"
+  SSHD_PORT="$ACTUAL_PORT"
+elif [ -z "$ACTUAL_PORT" ]; then
+  echo "[!] sshd 端口 $SSHD_PORT 未在监听列表中（sshd 可能未启动），先按配置端口 $SSHD_PORT 写入，sshd 起来后请重跑本脚本"
+fi
+echo "sshd 映射端口: $SSHD_PORT"
 
 echo "[3/5] 启动 MSYS2 sshd（Windows 服务，需管理员）..."
 SSD_WIN=$(cygpath -w "$SSHD_BIN" 2>/dev/null || cygpath -w /usr/sbin/sshd 2>/dev/null || echo "")
